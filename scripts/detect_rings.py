@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 import rclpy
 from rclpy.node import Node
@@ -169,9 +169,9 @@ class RingDetector(Node):
             y_min = y1 if y1 > 0 else 0
             y_max = y2 if y2 < cv_image.shape[1] else cv_image.shape[1]
 
-        if len(candidates)>0:
-                cv2.imshow("Detected rings",cv_image)
-                cv2.waitKey(1)
+        # if len(candidates)>0:
+        cv2.imshow("Detected rings",cv_image)
+        cv2.waitKey(1)
 
     def depth_callback(self,data):
 
