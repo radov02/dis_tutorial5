@@ -148,7 +148,7 @@ pcl::compute3DCentroid(*cloud_cylinder, centroid);
 ```
 
 ## TODO for students:
-As part of Task 1, you need to find the faces and the 3D rings in the course. The code in this exercise will NOT perform this tasks out of the box. You should either develop a completely new approach, or use this code as a starting point.
+As part of Task 1, you need to find the faces and the 3D rings in the course. The code in this exercise will NOT perform this task reliably out of the box. You should either develop a completely new approach, or use this code as a starting point.
 **General note:** Use markers in RVIZ to help with interpreting your robot's perception and knowledge. It is much easier than looking at terminal output. You can program markers to have different colors, sizes and shapes. Display the hardcoded points for movement, face locations, ring candidates, colors, etc.
 
 ### For face detection
