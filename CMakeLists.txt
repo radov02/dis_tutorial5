@@ -37,24 +37,8 @@ link_directories(${PCL_LIBRARY_DIRS})
 
 set(dependencies rclcpp std_msgs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions)
 
-add_executable(pcl_forwarder src/forwarder.cpp)
-ament_target_dependencies(pcl_forwarder ${dependencies})
-
-add_executable(planes src/planes.cpp)
-ament_target_dependencies(planes ${dependencies})
-
 add_executable(cylinder_segmentation src/cylinder_segmentation.cpp)
 ament_target_dependencies(cylinder_segmentation ${dependencies})
-
-target_link_libraries(pcl_forwarder
-  ${Boost_SYSTEM_LIBRARY}
-  ${PCL_LIBRARIES}
-)
-
-target_link_libraries(planes
-  ${Boost_SYSTEM_LIBRARY}
-  ${PCL_LIBRARIES}
-)
 
 target_link_libraries(cylinder_segmentation
   ${Boost_SYSTEM_LIBRARY}
@@ -62,8 +46,6 @@ target_link_libraries(cylinder_segmentation
 )
 
 install(TARGETS
-  pcl_forwarder
-  planes
   cylinder_segmentation
   DESTINATION lib/${PROJECT_NAME}
 )
