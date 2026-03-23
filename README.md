@@ -156,3 +156,26 @@ Your person detector will process every image and detect the face multiple times
 
 ### For ring detection
 There are two types of rings in the course, flat rings painted on boxes, and actual rings hanging in the air. You should only detect the free-standing rings and ignore the flat rings. You can use either or both 2D and 3D data to solve the task. You can also exploit the color information in the image (using color segmentation). For the 3D rings, there should be a hole in the inside ellipse, which can be verified from the point cloud or the depth image.
+
+
+
+
+## Try out the walk & greet
+- commands:
+  - `cd /home/erik/rins && colcon build`
+  - `source /home/erik/rins/install/setup.bash`
+  - T1: `ros2 run rmw_zenoh_cpp rmw_zenohd`
+  - T2: `ollama serve` (or check if already running: `ollama list`)
+  - T2: `ros2 launch dis_tutorial5 sim_turtlebot_nav.launch.py map:=/home/erik/rins/maps/maps.yaml` and use 2D Pose Estimate
+  - T3: `cd /home/erik/rins && source install/setup.bash && ros2 run dis_tutorial5 LLM.py`
+  - T4: `cd /home/erik/rins && source install/setup.bash && ros2 run dis_tutorial5 voice_capture --ros-args -p piper_model_path:=/home/erik/piper_models/en_US-lessac-medium/en_US-lessac-medium.onnx`
+  - optionally: T5 to make one test request: `cd /home/erik/rins && source install/setup.bash && ros2 service call /human_detected robot_interfaces/srv/HumanDetected "{detect_signal: true}"`
+  - T5: `ros2 run dis_tutorial5 detect_people2.py`
+  - T6: `ros2 run dis_tutorial5 detect_rings.py`
+  - T7: `ros2 run dis_tutorial5 robot_commander.py`
+
+
+## Geofencing
+- once map had been scanned we want to adjust the allowed area to prevent robot from going on illegal places (island)
+- firstly we run `python3 src/dis_tutorial5/scripts/map_geofence_tool.py --preview --apply` and adjust the area
+- then when done press ENTER to get the fenced allowed area (copy the array into the `ALLOWED_AREA_POLYGON` used in the `robot_commander.py` if it did not change)

@@ -54,4 +54,29 @@ install(PROGRAMS
   scripts/detect_rings.py
   DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS
+  scripts/detect_people2.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
+  scripts/LLM.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
+  scripts/robot_commander.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS scripts/voice_capture.py
+  RENAME voice_capture
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS scripts/map_geofence_tool.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME})
+
 ament_package()
