@@ -738,13 +738,29 @@ class RobotCommander(Node):
         self.info("Ring detection subscriber initialised (listening to /detected_rings).")
 
     def _detected_rings_callback(self, msg: MarkerArray):
-        """Receive ring detections from detect_rings node and accumulate them."""
+        """Sync local ring list with the authoritative MarkerArray from detect_rings.
+
+        detect_rings already handles deduplication and running-average position
+        updates, so we simply mirror its current state rather than trying to
+        re-add markers individually (which would accumulate duplicates as the
+        running-average positions drift slightly across publishes).
+        """
+        fresh = []
         for marker in msg.markers:
             x = marker.pose.position.x
             y = marker.pose.position.y
             z = marker.pose.position.z
             color_name = marker.text if marker.text else "unknown"
-            self._add_ring_detection(x, y, z, color_name)
+            if math.isnan(x) or math.isnan(y):
+                continue
+            if not self._is_in_allowed_area(x, y):
+                self.warn(f"Ring at ({x:.2f}, {y:.2f}) outside allowed area – ignoring.")
+                continue
+            fresh.append((x, y, z, color_name))
+
+        if len(fresh) != len(self.ring_detections):
+            self.ring_detections = fresh
+            self.info(f"Ring list updated: {len(self.ring_detections)} ring(s) known.")
 
     # ---- accumulation & persistence ----
 
