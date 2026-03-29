@@ -98,6 +98,11 @@ class RobotCommander(Node):
         self.timer = self.create_timer(1.0, self.timer_callback)
 
         self._init_ring_detection()
+        # Cooperative queues for face/ring reactive behaviors (consumed by main loop)
+        self._pending_face_approach: list[tuple[float, float]] = []
+        self._pending_ring_inspect: list[tuple[float, float]]  = []
+        self._inspected_rings: set[tuple[float, float]] = set()   # already inspected
+        self._approached_faces: set[tuple[float, float]] = set()  # already approached
         self.get_logger().info("Robot commander initialized.")
 
     def destroyNode(self):
@@ -118,6 +123,9 @@ class RobotCommander(Node):
         gy = pose.pose.position.y
         if not self._is_in_allowed_area(gx, gy):
             self.error(f'Goal ({gx:.2f}, {gy:.2f}) is outside the geofence – refusing.')
+            return False
+        if not self._is_within_costmap_bounds(gx, gy):
+            self.warn(f'Goal ({gx:.2f}, {gy:.2f}) is outside costmap bounds – skipping.')
             return False
 
         self.debug("Waiting for 'NavigateToPose' action server")
@@ -407,21 +415,18 @@ class RobotCommander(Node):
         return wx, wy
 
     def _is_in_allowed_area(self, wx: float, wy: float) -> bool:
-        """Return True if (wx, wy) is inside ALLOWED_AREA_POLYGON (ray-casting)."""
-        poly = ALLOWED_AREA_POLYGON
-        n = len(poly)
-        if n < 3:
-            return True  # degenerate polygon -> no restriction
-        inside = False
-        px, py = wx, wy
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
-                inside = not inside
-            j = i
-        return inside
+        # Geofencing removed — allow all positions
+        return True
+
+    def _is_within_costmap_bounds(self, wx: float, wy: float) -> bool:
+        """Return True if (wx, wy) maps to a valid cell inside the global costmap.
+        Prevents 'worldToMap failed' errors when Nav2 receives out-of-bounds goals."""
+        if not hasattr(self, '_global_costmap') or self._global_costmap is None:
+            return True  # no costmap yet; let Nav2 decide
+        row, col = self._world_to_cell(self._global_costmap, wx, wy)
+        h = self._global_costmap.info.height
+        w = self._global_costmap.info.width
+        return 0 <= row < h and 0 <= col < w
 
     def _is_cliff_safe(self) -> bool:
         """Return False if the cliff/drop sensor is active."""
@@ -613,7 +618,16 @@ class RobotCommander(Node):
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=1))
 
-        self.info("Ring detection subscriber initialised (listening to /detected_rings).")
+        # Also subscribe to face detections (other node should publish MarkerArray to /detected_faces)
+        self.face_detection_sub = self.create_subscription(
+            MarkerArray, "/detected_faces", self._detected_faces_callback,
+            QoSProfile(
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1))
+
+        self.info("Ring detection subscriber initialised (listening to /detected_rings and /detected_faces).")
 
     def _detected_rings_callback(self, msg: MarkerArray):
         """Mirror the ring list from detect_rings (dedup happens there)."""
@@ -625,14 +639,30 @@ class RobotCommander(Node):
             color_name = marker.text if marker.text else "unknown"
             if math.isnan(x) or math.isnan(y):
                 continue
-            if not self._is_in_allowed_area(x, y):
-                self.warn(f"Ring at ({x:.2f}, {y:.2f}) outside allowed area – ignoring.")
-                continue
             fresh.append((x, y, z, color_name))
+
+        # Determine which rings are new (rounded coords to avoid tiny jitter)
+        prev_set = set((round(r[0], 2), round(r[1], 2), r[3]) for r in self.ring_detections)
+        fresh_set = set((round(r[0], 2), round(r[1], 2), r[3]) for r in fresh)
+        new_rounded = fresh_set - prev_set
 
         if len(fresh) != len(self.ring_detections):
             self.ring_detections = fresh
             self.info(f"Ring list updated: {len(self.ring_detections)} ring(s) known.")
+
+        # Queue newly-seen rings for left/right inspection by the main loop
+        for nr in new_rounded:
+            rx, ry, rcolor = nr
+            match = next((r for r in fresh if round(r[0], 2) == rx and round(r[1], 2) == ry and r[3] == rcolor), None)
+            if match is None:
+                continue
+            key = (round(match[0], 1), round(match[1], 1))
+            if key in self._inspected_rings:
+                continue
+            if not any(math.hypot(match[0] - qx, match[1] - qy) < 0.5
+                       for qx, qy in self._pending_ring_inspect):
+                self._pending_ring_inspect.append((match[0], match[1]))
+                self.info(f'Queued ring inspection at ({match[0]:.2f}, {match[1]:.2f})')
 
     # ---- accumulation & persistence ----
 
@@ -649,6 +679,121 @@ class RobotCommander(Node):
         self.ring_detections.append((x, y, z, color_name))
         self.info(f"New ring detected! colour={color_name}  pos=({x:.2f}, {y:.2f}, {z:.2f})  total={len(self.ring_detections)}")
 
+    # -------------------- Face + ring reactive behaviors -----------------------
+
+    def _detected_faces_callback(self, msg: MarkerArray):
+        """Queue detected faces for approach by the main navigation loop.
+        Expects markers with pose in the map frame (x,y).
+        """
+        if not msg.markers:
+            return
+        for marker in msg.markers:
+            x = marker.pose.position.x
+            y = marker.pose.position.y
+            if math.isnan(x) or math.isnan(y):
+                continue
+            key = (round(x, 1), round(y, 1))
+            if key in self._approached_faces:
+                continue
+            # avoid duplicate queue entries
+            if any(math.hypot(x - qx, y - qy) < 1.0
+                   for qx, qy in self._pending_face_approach):
+                continue
+            self._pending_face_approach.append((x, y))
+            self.info(f'Queued face approach at ({x:.2f}, {y:.2f})')
+
+    # --- these are called from the main loop (NOT from background threads) ---
+
+    def _approach_face(self, x: float, y: float, stop_distance: float = 0.8):
+        """Navigate toward a face for better localization.  Called inline from the
+        main navigation loop so there are no shared-state race conditions."""
+        self._approached_faces.add((round(x, 1), round(y, 1)))
+        if not hasattr(self, 'current_pose'):
+            self.warn('No current_pose; cannot approach face.')
+            return
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        dx, dy = x - rx, y - ry
+        dist = math.hypot(dx, dy)
+        if dist <= stop_distance:
+            self.info('Already close to detected face.')
+            return
+
+        # Aim at a point stop_distance away from the face, along the face->robot vector
+        aim_x = x - (dx / dist) * stop_distance
+        aim_y = y - (dy / dist) * stop_distance
+
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = aim_x
+        goal.pose.position.y = aim_y
+        # Face toward the detected face
+        goal.pose.orientation = self.YawToQuaternion(math.atan2(y - aim_y, x - aim_x))
+
+        self.info(f'Approaching face at ({x:.2f},{y:.2f}) -> ({aim_x:.2f},{aim_y:.2f})')
+        if not self.goToPose(goal):
+            self.warn('Face-approach goal rejected.')
+            return
+
+        deadline = time.time() + 30.0
+        while not self.isTaskComplete():
+            time.sleep(0.1)
+            if time.time() > deadline:
+                self.warn('Face approach timed out; cancelling.')
+                self.cancelTask()
+                break
+        # Brief pause to let sensors observe the face up close
+        time.sleep(2.0)
+
+    def _inspect_ring(self, x: float, y: float, radius: float = 0.8, angle_offset: float = 0.6):
+        """Visit two viewpoints (left/right) around a ring to improve its localization.
+        Called inline from the main loop."""
+        self._inspected_rings.add((round(x, 1), round(y, 1)))
+        if not hasattr(self, 'current_pose'):
+            self.warn('No current_pose; cannot inspect ring.')
+            return
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        base_angle = math.atan2(ry - y, rx - x)
+
+        for ang in [base_angle + angle_offset, base_angle - angle_offset]:
+            px = x + math.cos(ang) * radius
+            py = y + math.sin(ang) * radius
+
+            goal = PoseStamped()
+            goal.header.frame_id = 'map'
+            goal.header.stamp = self.get_clock().now().to_msg()
+            goal.pose.position.x = px
+            goal.pose.position.y = py
+            goal.pose.orientation = self.YawToQuaternion(math.atan2(y - py, x - px))
+
+            self.info(f'Inspecting ring at ({x:.2f},{y:.2f}) from ({px:.2f},{py:.2f})')
+            if not self.goToPose(goal):
+                self.warn('Ring-inspect goal rejected; skipping viewpoint.')
+                continue
+
+            deadline = time.time() + 20.0
+            while not self.isTaskComplete():
+                time.sleep(0.1)
+                if time.time() > deadline:
+                    self.warn('Ring inspect timed out; cancelling.')
+                    self.cancelTask()
+                    break
+            # Short pause to let sensors observe from this angle
+            time.sleep(2.0)
+
+    def _process_pending_detections(self):
+        """Drain the face-approach and ring-inspect queues (called from main loop)."""
+        while self._pending_face_approach:
+            x, y = self._pending_face_approach.pop(0)
+            self.info(f'>>> Processing face approach ({x:.2f}, {y:.2f})')
+            self._approach_face(x, y)
+        while self._pending_ring_inspect:
+            x, y = self._pending_ring_inspect.pop(0)
+            self.info(f'>>> Processing ring inspection ({x:.2f}, {y:.2f})')
+            self._inspect_ring(x, y)
+
     def save_ring_detections(self, filepath):
         """Persist ring detections to a JSON file."""
         data = [{"x": x, "y": y, "z": z, "color": color}
@@ -659,7 +804,9 @@ class RobotCommander(Node):
 
     def find_people_and_rings_autonomously(self):
         """Navigate to all traversable viewpoints in the global costmap to search
-        for people and rings."""
+        for people and rings.  Viewpoints are dynamically re-sorted by proximity
+        to the robot's current position so the nearest unvisited one is always
+        chosen next."""
         self.get_logger().info("Starting autonomous search for people and rings...")
         self._init_autonomous_search()
 
@@ -672,33 +819,35 @@ class RobotCommander(Node):
                 self.error("Global costmap never received. Aborting.")
                 return
 
-        viewpoints = self._sample_candidate_viewpoints()
-        if not viewpoints:
+        remaining = self._sample_candidate_viewpoints()
+        if not remaining:
             self.error("No traversable viewpoints found in global costmap.")
             return
 
-        start_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
-        start_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
-        ordered = self._order_viewpoints_by_proximity(viewpoints, start_x, start_y)
-        self.info(f"Visiting {len(ordered)} viewpoints.")
-
+        total = len(remaining)
+        visited = 0
         MAX_RETRIES = 2
         retry_counts: dict[tuple[float, float], int] = {}
 
-        for idx, (wx, wy) in enumerate(ordered):
-            self.info(f"[{idx+1}/{len(ordered)}] Viewpoint ({wx:.2f}, {wy:.2f})")
+        while remaining:
+            # --- always pick the closest viewpoint to the robot's current pose ---
+            cx = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+            cy = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+            remaining.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            wx, wy = remaining.pop(0)
+            visited += 1
 
-            # Skip viewpoints too close – robot body inflates local costs there
-            dist_to_robot = math.sqrt((wx - start_x) ** 2 + (wy - start_y) ** 2)
+            self.info(f"[{visited}/{total}] Viewpoint ({wx:.2f}, {wy:.2f})")
+
+            # --- handle pending face / ring detections first ---
+            self._process_pending_detections()
+
+            dist_to_robot = math.hypot(wx - cx, wy - cy)
             if dist_to_robot < 0.5:
                 self.info(f"  Too close ({dist_to_robot:.2f} m); skipping.")
                 continue
 
-            if not self._is_in_allowed_area(wx, wy):
-                self.warn(f"  Outside geofence; skipping.")
-                continue
-
-            time.sleep(0.05)  # let callbacks flush
+            time.sleep(0.05)
             if not self._is_cliff_safe():
                 continue
             if not self._is_local_costmap_clear(wx, wy):
@@ -710,7 +859,7 @@ class RobotCommander(Node):
             goal.pose.position.x = wx
             goal.pose.position.y = wy
             goal.pose.orientation = self.YawToQuaternion(
-                math.atan2(wy - start_y, wx - start_x))
+                math.atan2(wy - cy, wx - cx))
 
             if not self.goToPose(goal):
                 self.warn(f"  Goal rejected by Nav2; skipping.")
@@ -718,40 +867,52 @@ class RobotCommander(Node):
 
             self._obstacle_blocked = False
             self._nav_goal_start_time = time.time()
-            nav_deadline = time.time() + 120.0  # 2-minute per-waypoint timeout
+            nav_deadline = time.time() + 120.0
+            detection_interrupted = False
             while not self.isTaskComplete():
                 time.sleep(0.1)
-                # _check_obstacle_ahead_callback runs on timer and cancels if needed;
-                # also do an explicit cliff check here
                 if not self._is_cliff_safe():
                     self.warn("Cliff detected mid-navigation; cancelling.")
                     self.cancelTask()
                     break
                 if self._obstacle_blocked:
-                    # Already cancelled by the timer callback – stop waiting.
                     break
                 if time.time() > nav_deadline:
                     self.warn(f"  Navigation to ({wx:.2f}, {wy:.2f}) timed out; cancelling.")
                     self.cancelTask()
                     break
+                # If a face/ring was detected while navigating, cancel and attend to it
+                if self._pending_face_approach or self._pending_ring_inspect:
+                    self.info('Detection queued mid-navigation – cancelling to attend.')
+                    self.cancelTask()
+                    detection_interrupted = True
+                    break
+
+            # Process any pending detections that triggered the interruption
+            if detection_interrupted:
+                self._process_pending_detections()
+                # Re-add the current viewpoint so it is reconsidered
+                remaining.append((wx, wy))
+                continue
 
             if self._obstacle_blocked:
                 retries = retry_counts.get((wx, wy), 0) + 1
                 retry_counts[(wx, wy)] = retries
                 if retries < MAX_RETRIES:
-                    self.info(f"  Obstacle blocked path to ({wx:.2f}, {wy:.2f}); requeueing (attempt {retries}/{MAX_RETRIES}).")
-                    ordered.append((wx, wy))
+                    self.info(f"  Obstacle blocked ({wx:.2f}, {wy:.2f}); requeueing ({retries}/{MAX_RETRIES}).")
+                    remaining.append((wx, wy))
                 else:
-                    self.warn(f"  Obstacle blocked path to ({wx:.2f}, {wy:.2f}) {retries} times; giving up on this viewpoint.")
+                    self.warn(f"  Obstacle blocked ({wx:.2f}, {wy:.2f}) {retries} times; giving up.")
                 continue
 
             if self.getResult() != TaskResult.SUCCEEDED:
                 self.warn(f"  Navigation did not succeed ({self.getResult()}); skipping.")
                 continue
 
-            start_x, start_y = wx, wy
             self.info(f"  Covered. Rings so far: {len(self.ring_detections)}")
 
+        # Drain any remaining detections after all viewpoints are exhausted
+        self._process_pending_detections()
         self.info(f"Autonomous search complete. Detected {len(self.ring_detections)} ring(s).")
         self.save_ring_detections('/home/erik/rins/src/dis_tutorial5/ring_detections.json')
 

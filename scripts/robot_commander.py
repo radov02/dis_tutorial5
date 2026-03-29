@@ -15,7 +15,10 @@
 
 
 from enum import Enum
+import glob
 import json
+import os
+import sys
 import threading
 import time
 
@@ -964,41 +967,178 @@ class RobotCommander(Node):
         self.save_ring_detections(ring_detections_path)
 
 
+    def navigate_to_all_targets(self, detections_folder: str):
+        """Load people and ring JSON files from *detections_folder*, merge all
+        targets into a single list, then visit them in greedy closest-first order.
+
+        For people targets the robot triggers a voice interaction; for ring
+        targets it simply approaches and observes.
+        """
+        # ----- load people detections -----
+        targets: list[dict] = []  # {"x", "y", "type": "person"|"ring", ...}
+        people_files = sorted(glob.glob(os.path.join(detections_folder, 'people_detections*.json')))
+        for pf in people_files:
+            try:
+                with open(pf, 'r') as f:
+                    data = json.load(f)
+                for d in data:
+                    if isinstance(d, (list, tuple)):
+                        x, y = float(d[0]), float(d[1])
+                    else:
+                        x, y = float(d.get('x', d[0])), float(d.get('y', d[1]))
+                    if math.isnan(x) or math.isnan(y):
+                        continue
+                    targets.append({"x": x, "y": y, "type": "person"})
+                self.info(f"Loaded {len(data)} person(s) from {pf}")
+            except Exception as e:
+                self.warn(f"Could not load {pf}: {e}")
+
+        # ----- load ring detections -----
+        ring_files = sorted(glob.glob(os.path.join(detections_folder, 'ring_detections*.json')))
+        for rf in ring_files:
+            try:
+                with open(rf, 'r') as f:
+                    data = json.load(f)
+                for d in data:
+                    x = float(d['x'])
+                    y = float(d['y'])
+                    color = d.get('color', 'unknown')
+                    if math.isnan(x) or math.isnan(y):
+                        continue
+                    targets.append({"x": x, "y": y, "type": "ring", "color": color})
+                self.info(f"Loaded {len(data)} ring(s) from {rf}")
+            except Exception as e:
+                self.warn(f"Could not load {rf}: {e}")
+
+        if not targets:
+            self.warn("No targets loaded from detections folder.")
+            return
+
+        self.info(f"Navigating to {len(targets)} target(s) (closest-first)...")
+        remaining = list(targets)
+        PERSON_STANDOFF_M = 0.8
+        RING_STANDOFF_M = 0.5
+
+        while remaining:
+            # Current robot pose
+            cx = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+            cy = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+
+            # Pick closest target
+            remaining.sort(key=lambda t: (t['x'] - cx) ** 2 + (t['y'] - cy) ** 2)
+            target = remaining.pop(0)
+            tx, ty = target['x'], target['y']
+            ttype = target['type']
+            idx = len(targets) - len(remaining)
+
+            # Compute standoff goal
+            dx, dy = tx - cx, ty - cy
+            dist = math.hypot(dx, dy)
+            standoff = PERSON_STANDOFF_M if ttype == 'person' else RING_STANDOFF_M
+            if dist > standoff:
+                goal_x = tx - (dx / dist) * standoff
+                goal_y = ty - (dy / dist) * standoff
+            else:
+                goal_x, goal_y = cx, cy  # already close
+
+            yaw = math.atan2(ty - goal_y, tx - goal_x)
+
+            label = ttype if ttype == 'person' else f"{target.get('color', '')} ring"
+            self.info(f"[{idx}/{len(targets)}] -> {label} at ({tx:.2f}, {ty:.2f})")
+
+            # Prefetch voice interaction for persons while navigating
+            prefetch_result = [None]
+            prefetch_thread = None
+            if ttype == 'person':
+                def run_prefetch():
+                    prefetch_result[0] = self.trigger_voice_interaction(prefetching=True)
+                prefetch_thread = threading.Thread(target=run_prefetch, daemon=True)
+                prefetch_thread.start()
+
+            goal = PoseStamped()
+            goal.header.frame_id = 'map'
+            goal.header.stamp = self.get_clock().now().to_msg()
+            goal.pose.position.x = goal_x
+            goal.pose.position.y = goal_y
+            goal.pose.orientation = self.YawToQuaternion(yaw)
+
+            if not self.goToPose(goal):
+                self.warn(f"Goal for {label} rejected; skipping.")
+                if prefetch_thread:
+                    prefetch_thread.join(timeout=5.0)
+                continue
+
+            deadline = time.time() + 120.0
+            while not self.isTaskComplete():
+                time.sleep(0.5)
+                if time.time() > deadline:
+                    self.warn('Navigation timed out; cancelling.')
+                    self.cancelTask()
+                    break
+
+            result = self.getResult()
+            if result != TaskResult.SUCCEEDED:
+                self.warn(f"Nav to {label} at ({tx:.2f},{ty:.2f}) failed: {result}")
+                if prefetch_thread:
+                    prefetch_thread.join(timeout=5.0)
+                continue
+
+            # --- interact / observe ---
+            if ttype == 'person':
+                if prefetch_thread:
+                    prefetch_thread.join(timeout=30.0)
+                if prefetch_result[0]:
+                    resp = self.trigger_voice_interaction(prefetching=False)
+                    if resp:
+                        self.info(f"Finished interaction with person at ({tx:.2f},{ty:.2f})")
+                    else:
+                        self.warn(f"Playback not confirmed for person at ({tx:.2f},{ty:.2f})")
+                else:
+                    self.warn(f"Prefetch returned no text for person at ({tx:.2f},{ty:.2f})")
+            else:
+                self.info(f"Observing {target.get('color', '')} ring at ({tx:.2f},{ty:.2f})")
+                time.sleep(3.0)  # pause to observe the ring
+
+        self.info("Finished visiting all targets.")
+
+
     #rc.walk_to_persons_and_greet('/home/erik/rins/src/dis_tutorial5/people_detections.json')    # go to all saved persons
     #rc.walk_to_rings('/home/erik/rins/src/dis_tutorial5/ring_detections.json')  # go to all detected rings
 
 
 def main(args=None):
-    
-    rclpy.init(args=args)
+    import argparse
+
+    # Parse --detections-folder while letting ROS 2 pass its own args through
+    parser = argparse.ArgumentParser(description='Robot Commander – navigate to detected people & rings')
+    parser.add_argument('--detections-folder', type=str, default=None,
+                        help='Path to folder containing people_detections_*.json and ring_detections_*.json')
+    parsed, remaining = parser.parse_known_args(sys.argv[1:])
+
+    rclpy.init(args=remaining)
     rc = RobotCommander()
 
-    # Spin the node continuously in a background thread so that futures can be
-    # awaited from any thread (including the prefetch daemon) without competing
-    # over the executor.
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(rc)
-    executor_thread = threading.Thread(target=executor.spin, daemon=True)
-    executor_thread.start()
+    threading.Thread(target=executor.spin, daemon=True).start()
 
-    # Wait until Nav2 and Localizer are available
     rc.waitUntilNav2Active()
 
-    # Check if the robot is docked, only continue when a message is recieved
     while rc.is_docked is None:
         time.sleep(0.5)
-
-    # If it is docked, undock it first
     if rc.is_docked:
         rc.undock()
 
-
-    rc.find_people_and_rings_autonomously()  # go through the map autonomously and search for people and rings to save them to JSON
-
-
-
-
-    rc.spin(-0.57)
+    if parsed.detections_folder:
+        folder = parsed.detections_folder
+        if not os.path.isdir(folder):
+            rc.error(f'Detections folder does not exist: {folder}')
+        else:
+            rc.info(f'Loading detections from: {folder}')
+            rc.navigate_to_all_targets(folder)
+    else:
+        rc.info('No --detections-folder provided. Doing a small spin and exiting.')
+        rc.spin(-0.57)
 
     rc.destroyNode()
 

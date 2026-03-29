@@ -45,7 +45,7 @@ HOUGH_DP = 1.2        # inverse resolution ratio of the accumulator
 HOUGH_MIN_DIST = 1        # minimum distance between detected circle centres (px)
                           # OpenCV clamps this to ≥1 internally anyway
 HOUGH_PARAM1 = 87    # upper Canny threshold
-HOUGH_PARAM2 = 27     # accumulator threshold (lower -> more circles detected)
+HOUGH_PARAM2 = 30     # accumulator threshold (lower -> more circles detected)
 HOUGH_MIN_RADIUS = 1
 HOUGH_MAX_RADIUS = 50  # rings at ~0.5-3 m can span 5-60+ px in a 300 px image
 # Two-pass Hough split radius.  Pass 1 covers [HOUGH_MIN_RADIUS, HOUGH_SPLIT_RADIUS],
@@ -62,7 +62,7 @@ HOUGH_SPLIT_RADIUS = 15  # split point for two-pass Hough (px)
 # radius-relative threshold is far more robust than a fixed pixel count because
 # rings of different sizes / distances produce different absolute offsets.
 CONCENTRIC_CENTER_FRAC = 0.97  # max |centre offset| / outer_r
-CONCENTRIC_RATIO_MIN = 0.01  # min inner_r / outer_r  (too small -> almost solid disc)
+CONCENTRIC_RATIO_MIN = 0.1  # min inner_r / outer_r  (too small -> almost solid disc)
 CONCENTRIC_RATIO_MAX = 0.98  # max inner_r / outer_r  (too large -> almost no ring)
 
 # For thin rings, erode the depth visualisation before HoughCircles so that
@@ -102,14 +102,19 @@ class RingDetector(Node):
             namespace='',
             parameters=[
                 ('map_yaml_path', '/home/erik/rins/maps/map.yaml'),
+                ('world_name', ''),
             ])
 
         map_yaml_path = self.get_parameter('map_yaml_path').get_parameter_value().string_value
+        world_name    = self.get_parameter('world_name').get_parameter_value().string_value.strip()
         map_stem = os.path.splitext(os.path.basename(map_yaml_path))[0]
         _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _subfolder = os.path.join('/home/erik/rins/maps', _ts)
+        os.makedirs(_subfolder, exist_ok=True)
+        _world_suffix = f'_{world_name}' if world_name else ''
         self.ring_detections_json_path = os.path.join(
-            '/home/erik/rins/maps',
-            f'ring_detections_{map_stem}._{_ts}.json'
+            _subfolder,
+            f'ring_detections_{map_stem}{_world_suffix}.json'
         )
 
         self.bridge = CvBridge()
@@ -770,9 +775,61 @@ class RingDetector(Node):
             # --- colour from RGB annulus pixels (depth-derived coords scaled to RGB) ---
             color_name = self._get_ring_color(cv_image, px, py, outer_r, inner_r)
 
+            # --- 0.3 m wall-perpendicular offset (same idea as face detection) ---
+            # Sample depth at left/right outer-circle edges, back-project to /map,
+            # compute wall tangent, then nudge the marker 0.3 m toward the robot.
+            RING_OFFSET_M = 0.3
+            offset_applied = False
+            try:
+                robot_tf = self.tf_buffer.lookup_transform(
+                    "map", "base_link", rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.3))
+                robot_x = robot_tf.transform.translation.x
+                robot_y = robot_tf.transform.translation.y
+
+                left_depth  = self._sample_depth_patch(
+                    px - outer_r, py, 3, img_h, img_w)
+                right_depth = self._sample_depth_patch(
+                    px + outer_r, py, 3, img_h, img_w)
+
+                if left_depth is not None and right_depth is not None:
+                    left_map  = self._ring_map_position(
+                        px - outer_r, py, left_depth, data.header)
+                    right_map = self._ring_map_position(
+                        px + outer_r, py, right_depth, data.header)
+
+                    if left_map is not None and right_map is not None:
+                        tangent_dx = right_map[0] - left_map[0]
+                        tangent_dy = right_map[1] - left_map[1]
+                        tangent_norm = math.sqrt(tangent_dx**2 + tangent_dy**2)
+                        if tangent_norm > 0.01:
+                            # Perpendicular to tangent
+                            nx = -tangent_dy / tangent_norm
+                            ny =  tangent_dx / tangent_norm
+                            # Flip so it points toward robot
+                            to_robot_x = robot_x - wx
+                            to_robot_y = robot_y - wy
+                            if nx * to_robot_x + ny * to_robot_y < 0:
+                                nx, ny = -nx, -ny
+                            wx += nx * RING_OFFSET_M
+                            wy += ny * RING_OFFSET_M
+                            offset_applied = True
+
+                # Fallback: offset straight toward robot
+                if not offset_applied:
+                    to_r_dx = robot_x - wx
+                    to_r_dy = robot_y - wy
+                    to_r_dist = math.sqrt(to_r_dx**2 + to_r_dy**2)
+                    if to_r_dist > 0.01:
+                        wx += (to_r_dx / to_r_dist) * RING_OFFSET_M
+                        wy += (to_r_dy / to_r_dist) * RING_OFFSET_M
+            except Exception as e:
+                self.get_logger().debug(f"Ring offset TF failed: {e}")
+
             print(f"  Valid ring at ({px},{py}): depth={depth_m:.2f} m  "
                   f"diam={diameter_m*100:.1f} cm  "
-                  f"map=({wx:.2f}, {wy:.2f}, {wz:.2f})  colour={color_name}")
+                  f"map=({wx:.2f}, {wy:.2f}, {wz:.2f})  colour={color_name}"
+                  f"  offset={'wall' if offset_applied else 'robot-fallback'}")
 
             self._process_ring_detection(wx, wy, wz, color_name)
 

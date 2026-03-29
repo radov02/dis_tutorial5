@@ -76,9 +76,11 @@ class detect_faces(Node):
 
 		map_stem = os.path.splitext(os.path.basename(self.map_yaml_path))[0]
 		_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+		_subfolder = os.path.join('/home/erik/rins/maps', _ts)
+		os.makedirs(_subfolder, exist_ok=True)
 		self.detections_json_path = os.path.join(
-			'/home/erik/rins/maps',
-			f'people_detections_{map_stem}._{_ts}.json'
+			_subfolder,
+			f'people_detections_{map_stem}.json'
 		)
 
 		# load previously saved detections if available
