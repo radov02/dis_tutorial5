@@ -5,8 +5,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
 from rclpy.duration import Duration
 
-from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2 as pc2
+from sensor_msgs.msg import Image, CameraInfo
 
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -49,7 +48,8 @@ class detect_faces(Node):
 		self.scan = None
 
 		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
-		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
+		self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, qos_profile_sensor_data)
+		self.camera_info_sub = self.create_subscription(CameraInfo, "/oakd/rgb/preview/camera_info", self.camera_info_callback, qos_profile_sensor_data)
 
 		self.marker_array_pub = self.create_publisher(MarkerArray, "/people_marker_array", QoSReliabilityPolicy.BEST_EFFORT)
 
@@ -57,12 +57,17 @@ class detect_faces(Node):
 
 		self.faces = []
 
+		# Depth & camera intrinsics state (same approach as detect_rings)
+		self.latest_depth_image = None
+		self.latest_depth_header = None
+		self.camera_info = None
+
 		# we will save face positions in the map coordinates:
 		self.face_position_in_map_coordinates = []
 		self.face_best_alignment_score = []  # tracks best combined score per face
 		# minimum distance (meters) between two detections to consider them different people
 		self.dedup_distance = 1.5
-		# max_detection_z: height in map frame (Z=up). A person's face is ~1.0–1.8 m.
+		# max_detection_z: height in map frame (Z=up). A person's face is ~1.0-1.8 m.
 		self.max_detection_z = 2.0
 
 		# map info for saving detections to PGM
@@ -124,6 +129,11 @@ class detect_faces(Node):
 
 					self.faces.append({'cx': cx, 'cy': cy, 'bbox': (x1, y1, x2, y2)})
 
+			# Process detected faces using depth image + intrinsics
+			# (same approach as detect_rings - proven to produce correct map coords)
+			if self.faces and self.latest_depth_image is not None and self.camera_info is not None:
+				self.process_detections(data, cv_image.shape[:2])
+
 			cv2.imshow("image", cv_image)
 			key = cv2.waitKey(1)
 			if key==27:
@@ -133,43 +143,82 @@ class detect_faces(Node):
 		except CvBridgeError as e:
 			print(e)
 
-	def pointcloud_callback(self, data):
+	def depth_callback(self, data):
+		"""Store latest depth image for use in face processing."""
+		try:
+			depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
+		except CvBridgeError as e:
+			print(e)
+			return
+		depth_image[~np.isfinite(depth_image)] = np.nan
+		self.latest_depth_image = depth_image
+		self.latest_depth_header = data.header
 
-		# get point cloud attributes
-		height = data.height
-		width = data.width
+	def camera_info_callback(self, msg):
+		self.camera_info = msg
 
-		# decode point cloud once per callback
-		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
-		a = a.reshape((height, width, 3))
+	def _sample_depth_at_pixel(self, px, py, img_h, img_w, patch_r=3):
+		"""Sample median depth at pixel (px, py) in RGB-image space.
+		Handles resolution mismatch between RGB and depth images."""
+		if self.latest_depth_image is None:
+			return None
+		dh, dw = self.latest_depth_image.shape[:2]
+		dpx = int(px * dw / img_w) if img_w != dw else int(px)
+		dpy = int(py * dh / img_h) if img_h != dh else int(py)
+		dpx = int(np.clip(dpx, 0, dw - 1))
+		dpy = int(np.clip(dpy, 0, dh - 1))
 
-		# The PointCloud2 data comes in the optical frame (X=right, Y=down, Z=forward)
-		# with frame_id = "oakd_rgb_camera_optical_frame".
-		# The system URDF (turtlebot4_description) has the CORRECT rotation
-		# rpy=(-pi/2, 0, -pi/2) for the optical→body joint, so TF2 handles the
-		# axis conversion automatically.  Pass raw XYZ directly — do NOT apply
-		# a manual opt_to_body conversion (that would double-rotate!).
-		# (The local dis_tutorial5/urdf copy has an identity rotation, but it is
-		# NOT used at runtime — the launch loads from turtlebot4_description.)
-		#
-		# detect_rings.py uses opt_to_body because it constructs optical XYZ from
-		# pixel+depth+intrinsics, so it must convert manually before handing to
-		# the body frame.  Here we read XYZ from the PointCloud2 which already
-		# has the correct frame_id for TF2 to handle.
-		source_frame = "oakd_rgb_camera_optical_frame"
+		y0, y1 = max(0, dpy - patch_r), min(dh, dpy + patch_r + 1)
+		x0, x1 = max(0, dpx - patch_r), min(dw, dpx + patch_r + 1)
+		patch = self.latest_depth_image[y0:y1, x0:x1]
 
-		# Log frame_id once for debugging
+		valid = patch[np.isfinite(patch) & (patch > 0)]
+		if len(valid) == 0:
+			return None
+
+		depth = float(np.median(valid))
+		# OAK-D may report in mm (value > 100) or metres
+		depth_m = depth / 1000.0 if depth > 100 else depth
+		if depth_m <= 0.05 or depth_m > 15.0:
+			return None
+		return depth_m
+
+	def _backproject_to_body(self, px, py, depth_m):
+		"""Back-project RGB pixel to camera body frame using intrinsics.
+		Uses the same optical-to-body conversion as detect_rings:
+		  body_X =  opt_Z  (depth  -> forward)
+		  body_Y = -opt_X  (right  -> left, negated)
+		  body_Z = -opt_Y  (down   -> up, negated)
+		"""
+		fx = self.camera_info.k[0]
+		fy = self.camera_info.k[4]
+		cx = self.camera_info.k[2]
+		cy = self.camera_info.k[5]
+
+		x_opt = (px - cx) * depth_m / fx
+		y_opt = (py - cy) * depth_m / fy
+		z_opt = depth_m
+
+		return (z_opt, -x_opt, -y_opt)
+
+	def process_detections(self, rgb_msg, img_shape):
+		"""Process detected faces using depth image + camera intrinsics.
+		Uses the same back-projection approach as detect_rings to ensure
+		correct map positioning."""
+		img_h, img_w = img_shape
+		source_frame = "oakd_rgb_camera_frame"
+		stamp = rgb_msg.header.stamp
+
+		# Log once for debugging
 		if not hasattr(self, '_logged_source_frame'):
-			actual_frame = data.header.frame_id if data.header.frame_id else "(empty)"
 			self.get_logger().info(
-				f"PointCloud2 frame_id='{actual_frame}', "
-				f"pointcloud size={data.height}x{data.width}, "
-				f"using source_frame='{source_frame}' for TF"
+				f"Using depth+intrinsics back-projection (same as detect_rings), "
+				f"source_frame='{source_frame}'"
 			)
 			self._logged_source_frame = True
-			self._diag_count = 0  # count diagnostic detections
+			self._diag_count = 0
 
-		# get robot position once for normal orientation and fallback
+		# get robot position for offset orientation and fallback
 		robot_x = None
 		robot_y = None
 		try:
@@ -177,26 +226,24 @@ class detect_faces(Node):
 			robot_x = trans.transform.translation.x
 			robot_y = trans.transform.translation.y
 		except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-			self.get_logger().warn(f"Could not look up base_link -> map transform for offset orientation: {e}")
+			self.get_logger().warn(f"Could not look up base_link -> map transform: {e}")
 
-		# iterate over face coordinates
 		for detection in self.faces:
-			x = detection['cx']
-			y = detection['cy']
+			px = detection['cx']
+			py = detection['cy']
 			x1, y1, x2, y2 = detection['bbox']
 
-			# read center coordinates
-			d = self.get_valid_point_around(a, x, y)
-
-			# skip invalid (NaN) depth readings
-			if d is None:
-				self.get_logger().warn("Skipping detection with NaN depth")
+			# Sample depth at bbox center
+			depth_m = self._sample_depth_at_pixel(px, py, img_h, img_w)
+			if depth_m is None:
+				self.get_logger().warn("Skipping detection: no valid depth")
 				continue
 
-			# Transform the pointcloud XYZ directly from the optical frame to map.
-			# TF2 applies the optical→body rotation from the system URDF.
+			# Back-project to body frame (same as detect_rings)
+			body_xyz = self._backproject_to_body(px, py, depth_m)
+
 			try:
-				point_in_map = self.transform_point_to_map(d, source_frame)
+				point_in_map = self.transform_point_to_map(body_xyz, source_frame, stamp)
 				map_x = point_in_map.point.x
 				map_y = point_in_map.point.y
 				map_z = point_in_map.point.z
@@ -205,16 +252,15 @@ class detect_faces(Node):
 				diag_count = getattr(self, '_diag_count', 0)
 				if diag_count < 5:
 					self.get_logger().info(
-						f"[DIAG {diag_count}] optical=({d[0]:.3f},{d[1]:.3f},{d[2]:.3f}) "
-						f"→ map=({map_x:.2f},{map_y:.2f},{map_z:.2f}) "
-						f"robot=({robot_x:.2f},{robot_y:.2f})" if robot_x is not None else
-						f"[DIAG {diag_count}] optical=({d[0]:.3f},{d[1]:.3f},{d[2]:.3f}) "
-						f"→ map=({map_x:.2f},{map_y:.2f},{map_z:.2f}) robot=N/A"
+						f"[DIAG {diag_count}] px=({px},{py}) depth={depth_m:.2f}m "
+						f"body=({body_xyz[0]:.3f},{body_xyz[1]:.3f},{body_xyz[2]:.3f}) "
+						f"-> map=({map_x:.2f},{map_y:.2f},{map_z:.2f}) "
+						+ (f"robot=({robot_x:.2f},{robot_y:.2f})" if robot_x is not None else "robot=N/A")
 					)
 					self._diag_count = diag_count + 1
 
 				if map_z > self.max_detection_z:
-					self.get_logger().warn(f"Skipping detection: center z={map_z:.2f}m exceeds max_detection_z={self.max_detection_z:.2f}m")
+					self.get_logger().warn(f"Skipping: z={map_z:.2f}m > max {self.max_detection_z:.2f}m")
 					continue
 
 				# Compute wall tangent from left/right bbox corners in map space,
@@ -224,14 +270,17 @@ class detect_faces(Node):
 				angle_of_view = None
 				normal = None
 
-				right_corner_xyz = self.get_valid_point_around(a, x2, y)
-				left_corner_xyz  = self.get_valid_point_around(a, x1, y)
+				right_depth = self._sample_depth_at_pixel(x2, py, img_h, img_w)
+				left_depth  = self._sample_depth_at_pixel(x1, py, img_h, img_w)
 				point_in_map_right_bbox_corner = None
 				point_in_map_left_bbox_corner  = None
-				if right_corner_xyz is not None:
-					point_in_map_right_bbox_corner = self.transform_point_to_map(right_corner_xyz, source_frame)
-				if left_corner_xyz is not None:
-					point_in_map_left_bbox_corner  = self.transform_point_to_map(left_corner_xyz, source_frame)
+				if right_depth is not None:
+					right_body = self._backproject_to_body(x2, py, right_depth)
+					point_in_map_right_bbox_corner = self.transform_point_to_map(right_body, source_frame, stamp)
+				if left_depth is not None:
+					left_body = self._backproject_to_body(x1, py, left_depth)
+					point_in_map_left_bbox_corner = self.transform_point_to_map(left_body, source_frame, stamp)
+
 				if (robot_x is not None and robot_y is not None
 						and point_in_map_right_bbox_corner is not None
 						and point_in_map_left_bbox_corner  is not None):
@@ -274,10 +323,9 @@ class detect_faces(Node):
 						dist_to_face = 2.0  # neutral fallback
 
 					# Factor 1: bbox perpendicularity, sharpness scaled by distance
-					# close = forgiving (low k), far = strict (high k)
-					min_k = 1.0   # sharpness at ~0m (very forgiving)
-					max_k = 8.0   # sharpness at ref_dist and beyond (very strict)
-					ref_dist = 3.0  # distance at which max sharpness kicks in
+					min_k = 1.0
+					max_k = 8.0
+					ref_dist = 3.0
 					dist_norm = np.clip(dist_to_face / ref_dist, 0.0, 1.0)
 					perp_k = min_k + (max_k - min_k) * dist_norm
 
@@ -285,7 +333,6 @@ class detect_faces(Node):
 					perp_factor = np.exp(-perp_k * deviation_norm)
 
 					# Factor 2: camera view vector alignment with face normal
-					# also scaled by distance: far away you need tighter alignment
 					try:
 						cam_trans = self.tf_buf.lookup_transform(
 							"map", "base_link", rclpy.time.Time(), timeout=Duration(seconds=0.5)
@@ -319,58 +366,34 @@ class detect_faces(Node):
 						matched_idx = i
 						break
 
-				if is_new and dist_to_face < 3.0:  # also ignore very far detections as they are likely false positives
+				if is_new and dist_to_face < 3.0:
 					self.face_position_in_map_coordinates.append((map_x, map_y, map_z))
 					self.face_best_alignment_score.append(combined_score)
-					self.get_logger().info(f"NEW face in map coordinates: ({map_x:.2f}, {map_y:.2f}, {map_z:.2f}), score: {combined_score:.3f}")
+					self.get_logger().info(f"NEW face at ({map_x:.2f}, {map_y:.2f}, {map_z:.2f}), score: {combined_score:.3f}")
 				elif not is_new and matched_idx >= 0:
 					while len(self.face_best_alignment_score) <= matched_idx:
 						self.face_best_alignment_score.append(0.0)
 					prev_best = self.face_best_alignment_score[matched_idx]
 					if combined_score > prev_best:
-						# new observation is better aligned — replace position entirely
 						self.face_position_in_map_coordinates[matched_idx] = (map_x, map_y, map_z)
 						self.face_best_alignment_score[matched_idx] = combined_score
-						self.get_logger().info(f"UPDATED face {matched_idx} with better alignment score: {combined_score:.3f} > {prev_best:.3f}")
+						self.get_logger().info(f"UPDATED face {matched_idx}: score {combined_score:.3f} > {prev_best:.3f}")
 					else:
-						self.get_logger().debug(f"Kept face {matched_idx}, current score {combined_score:.3f} <= best {prev_best:.3f}")
+						self.get_logger().debug(f"Kept face {matched_idx}, score {combined_score:.3f} <= {prev_best:.3f}")
 
 			except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
 				self.get_logger().warn(f"Could not transform to map frame: {e}")
 
-		# re-publish all known detections as a MarkerArray so they all stay visible
 		self.publish_all_markers()
 
-	def get_valid_point_around(self, cloud_xyz, x, y, radius=3):
-		"""Return a valid xyz point near (x, y), or None if none found."""
-		# clip to camera frame's width and height
-		height, width, _ = cloud_xyz.shape
-		x = int(np.clip(x, 0, width - 1))
-		y = int(np.clip(y, 0, height - 1))
-
-		for r in range(radius + 1):
-			x_min = max(0, x - r)
-			x_max = min(width - 1, x + r)
-			y_min = max(0, y - r)
-			y_max = min(height - 1, y + r)
-
-			for yy in range(y_min, y_max + 1):
-				for xx in range(x_min, x_max + 1):
-					p = cloud_xyz[yy, xx, :]
-					if not (np.isnan(p[0]) or np.isnan(p[1]) or np.isnan(p[2])):
-						return p
-
-		return None
-
-	def transform_point_to_map(self, xyz_point, source_frame):
-		point_in_source_frame = PointStamped()
-		point_in_source_frame.header.frame_id = source_frame
-		point_in_source_frame.header.stamp = rclpy.time.Time().to_msg()  # latest available
-		point_in_source_frame.point.x = float(xyz_point[0])
-		point_in_source_frame.point.y = float(xyz_point[1])
-		point_in_source_frame.point.z = float(xyz_point[2])
-
-		return self.tf_buf.transform(point_in_source_frame, "map", timeout=Duration(seconds=0.5))
+	def transform_point_to_map(self, xyz_point, source_frame, stamp=None):
+		point_s = PointStamped()
+		point_s.header.frame_id = source_frame
+		point_s.header.stamp = stamp if stamp is not None else rclpy.time.Time().to_msg()
+		point_s.point.x = float(xyz_point[0])
+		point_s.point.y = float(xyz_point[1])
+		point_s.point.z = float(xyz_point[2])
+		return self.tf_buf.transform(point_s, "map", timeout=Duration(seconds=0.5))
 
 	def publish_all_markers(self):
 		"""Publish a MarkerArray with all stored face positions in the map frame."""
