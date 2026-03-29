@@ -1,9 +1,12 @@
 #!/usr/bin/python3
 
+import os
 import rclpy
 from rclpy.node import Node
 import cv2, math
+import json
 import numpy as np
+from datetime import datetime
 import tf2_geometry_msgs
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -42,7 +45,7 @@ HOUGH_DP = 1.2        # inverse resolution ratio of the accumulator
 HOUGH_MIN_DIST = 1        # minimum distance between detected circle centres (px)
                           # OpenCV clamps this to ≥1 internally anyway
 HOUGH_PARAM1 = 87    # upper Canny threshold
-HOUGH_PARAM2 = 25     # accumulator threshold (lower -> more circles detected)
+HOUGH_PARAM2 = 27     # accumulator threshold (lower -> more circles detected)
 HOUGH_MIN_RADIUS = 1
 HOUGH_MAX_RADIUS = 50  # rings at ~0.5-3 m can span 5-60+ px in a 300 px image
 # Two-pass Hough split radius.  Pass 1 covers [HOUGH_MIN_RADIUS, HOUGH_SPLIT_RADIUS],
@@ -95,6 +98,20 @@ class RingDetector(Node):
     def __init__(self):
         super().__init__('ring_detector')
 
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('map_yaml_path', '/home/erik/rins/maps/map.yaml'),
+            ])
+
+        map_yaml_path = self.get_parameter('map_yaml_path').get_parameter_value().string_value
+        map_stem = os.path.splitext(os.path.basename(map_yaml_path))[0]
+        _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.ring_detections_json_path = os.path.join(
+            '/home/erik/rins/maps',
+            f'ring_detections_{map_stem}._{_ts}.json'
+        )
+
         self.bridge = CvBridge()
 
         # Latest depth frame (float32, NaN where invalid) + matching header
@@ -128,6 +145,9 @@ class RingDetector(Node):
         # subscribes (even later) immediately gets the full current set.
         self.ring_marker_pub = self.create_publisher(
             MarkerArray, "/detected_rings", qos_profile)
+
+        # Load previously saved detections if available
+        self.load_detections()
 
         # Latest depth visualisation frame (uint8 grayscale) for HoughCircles
         self.latest_depth_viz: np.ndarray | None = None
@@ -825,6 +845,28 @@ class RingDetector(Node):
             f"NEW ring: colour={color_name} pos=({x:.2f}, {y:.2f}, {z:.2f}) total={len(self.ring_detections)}")
         self._publish_ring_markers()
 
+    def save_detections_to_json(self):
+        """Persist ring detections to a JSON file."""
+        try:
+            with open(self.ring_detections_json_path, 'w') as f:
+                json.dump(self.ring_detections, f, indent=2)
+            self.get_logger().info(f"Saved {len(self.ring_detections)} ring detections to {self.ring_detections_json_path}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save ring detections: {e}")
+
+    def load_detections(self):
+        """Load previously saved ring detections from JSON file."""
+        try:
+            with open(self.ring_detections_json_path, 'r') as f:
+                data = json.load(f)
+            self.ring_detections = data
+            self.get_logger().info(f"Loaded {len(self.ring_detections)} previous ring detections from {self.ring_detections_json_path}")
+            self._publish_ring_markers()
+        except FileNotFoundError:
+            self.get_logger().info("No previous ring detections file found, starting fresh.")
+        except Exception as e:
+            self.get_logger().warn(f"Could not load ring detections: {e}")
+
     def _publish_ring_markers(self):
         """Publish all confirmed rings as a MarkerArray on /detected_rings."""
         ma = MarkerArray()
@@ -835,26 +877,37 @@ class RingDetector(Node):
             m.header.stamp = self.get_clock().now().to_msg()
             m.ns = "detected_rings"
             m.id = i
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
+            m.type = 2
+
+            scale = 0.15
+            m.scale.x = scale
+            m.scale.y = scale
+            m.scale.z = scale
+
+            if cname == "red":
+                m.color.r = 1.0; m.color.g = 0.0; m.color.b = 0.0
+            elif cname == "green":
+                m.color.r = 0.0; m.color.g = 1.0; m.color.b = 0.0
+            elif cname == "blue":
+                m.color.r = 0.0; m.color.g = 0.0; m.color.b = 1.0
+            elif cname == "yellow":
+                m.color.r = 1.0; m.color.g = 1.0; m.color.b = 0.0
+            elif cname == "orange":
+                m.color.r = 1.0; m.color.g = 0.5; m.color.b = 0.0
+            elif cname == "purple":
+                m.color.r = 0.5; m.color.g = 0.0; m.color.b = 1.0
+            elif cname == "black":
+                m.color.r = 0.1; m.color.g = 0.1; m.color.b = 0.1
+            elif cname == "white":
+                m.color.r = 1.0; m.color.g = 1.0; m.color.b = 1.0
+            else:
+                m.color.r = 0.5; m.color.g = 0.5; m.color.b = 0.5
+            m.color.a = 1.0
+
             m.pose.position.x = x
             m.pose.position.y = y
             m.pose.position.z = z
-            m.scale.x = m.scale.y = m.scale.z = 0.15
-            m.text = cname  # color name for subscribers to read
-            c = ColorRGBA(a=1.0)
-            if cname == "red":      c.r = 1.0
-            elif cname == "green":  c.g = 1.0
-            elif cname == "blue":   c.b = 1.0
-            elif cname == "yellow": c.r = 1.0; c.g = 1.0
-            elif cname == "orange": c.r = 1.0; c.g = 0.5
-            elif cname == "purple": c.r = 0.5; c.b = 1.0
-            elif cname == "black":  c.r = c.g = c.b = 0.1
-            elif cname == "white":  c.r = c.g = c.b = 1.0
-            else:                   c.r = c.g = c.b = 0.5
-            m.color = c
-            m.lifetime.sec = 0
-            m.lifetime.nanosec = 0
+
             ma.markers.append(m)
         self.ring_marker_pub.publish(ma)
 
@@ -863,8 +916,14 @@ def main():
 
     rclpy.init(args=None)
     rd_node = RingDetector()
-
-    rclpy.spin(rd_node)
+    try:
+        rclpy.spin(rd_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rd_node.save_detections_to_json()
+        rd_node.destroy_node()
+        rclpy.shutdown()
 
     cv2.destroyAllWindows()
 

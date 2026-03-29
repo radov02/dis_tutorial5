@@ -18,7 +18,7 @@ Usage
   # 4. Auto-patch robot_commander.py after defining the polygon:
   python3 map_geofence_tool.py --apply
 
-The script auto-locates maps.yaml / maps.pgm from the standard dis_tutorial3 path,
+The script auto-locates maps.yaml / maps.pgm from /home/erik/rins/maps/,
 or you can pass --map /path/to/maps.yaml explicitly.
 """
 
@@ -38,7 +38,7 @@ import yaml
 # ---------------------------------------------------------------------------
 # Default paths (adjust if your checkout is elsewhere)
 # ---------------------------------------------------------------------------
-DEFAULT_YAML = Path(__file__).resolve().parents[3] / "src/dis_tutorial3/maps/maps.yaml"
+DEFAULT_YAML = Path('/home/erik/rins/maps/maps.yaml')
 # Fallback: look next to this script
 _ALT_YAML    = Path(__file__).resolve().parent / "maps/maps.yaml"
 

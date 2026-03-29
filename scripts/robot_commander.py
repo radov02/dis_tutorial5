@@ -964,6 +964,8 @@ class RobotCommander(Node):
         self.save_ring_detections(ring_detections_path)
 
 
+    #rc.walk_to_persons_and_greet('/home/erik/rins/src/dis_tutorial5/people_detections.json')    # go to all saved persons
+    #rc.walk_to_rings('/home/erik/rins/src/dis_tutorial5/ring_detections.json')  # go to all detected rings
 
 
 def main(args=None):
@@ -991,11 +993,9 @@ def main(args=None):
         rc.undock()
 
 
-    #rc.find_people_and_rings_autonomously()  # firstly go through the map autonomously and search for people and rings to save them
-    # Ring detections are saved to JSON inside find_people_and_rings_autonomously
+    rc.find_people_and_rings_autonomously()  # go through the map autonomously and search for people and rings to save them to JSON
 
-    #rc.walk_to_persons_and_greet('/home/erik/rins/src/dis_tutorial5/people_detections.json')    # go to all saved persons
-    #rc.walk_to_rings('/home/erik/rins/src/dis_tutorial5/ring_detections.json')  # go to all detected rings
+
 
 
     rc.spin(-0.57)

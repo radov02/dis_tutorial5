@@ -17,12 +17,11 @@
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo
+from launch.actions import IncludeLaunchDescription, RegisterEventHandler
+from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-
-pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
 
 ARGUMENTS = [
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
@@ -32,18 +31,21 @@ ARGUMENTS = [
         description='Simulation World (from /home/erik/rins/worlds)'),
     DeclareLaunchArgument('model', default_value='standard', choices=['standard', 'lite'], description='Turtlebot4 Model'),
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time'),
-    DeclareLaunchArgument('map', default_value='/home/erik/rins/maps/maps.yaml', description='Full path to map yaml file to load'),
+    DeclareLaunchArgument('map_save_path', default_value='/home/erik/rins/maps/maps',
+        description='Path (without extension) where the map will be saved on shutdown as .pgm + .yaml'),
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
     ARGUMENTS.append(DeclareLaunchArgument(pose_element, default_value='0.0', description=f'{pose_element} component of the robot pose.'))
 
-def generate_launch_description():    
+def generate_launch_description():
+    # Directories
+    pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
+    
     # Launch Files
     gazebo_launch = PathJoinSubstitution([pkg_dis_tutorial5, 'launch', 'sim.launch.py'])
     robot_spawn_launch = PathJoinSubstitution([pkg_dis_tutorial5, 'launch', 'turtlebot4_spawn.launch.py'])
-    localization_launch = PathJoinSubstitution([pkg_dis_tutorial5, 'launch', 'localization.launch.py'])
-    nav2_launch = PathJoinSubstitution([pkg_dis_tutorial5, 'launch', 'nav2.launch.py'])
+    slam_launch = PathJoinSubstitution([pkg_dis_tutorial5, 'launch', 'slam.launch.py'])
 
     #Simulator and world
     gazebo = IncludeLaunchDescription(
@@ -68,31 +70,39 @@ def generate_launch_description():
             ('world', LaunchConfiguration('world')),
         ]
     )
-    
-    # Localization
-    localization = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([localization_launch]),
-        launch_arguments=[
-            ('namespace', LaunchConfiguration('namespace')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time')),
-            ('map', LaunchConfiguration('map')),
-        ]
-    )
 
-    # Nav2
-    nav2 = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([nav2_launch]),
+    # SLAM
+    slam = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([slam_launch]),
         launch_arguments=[
             ('namespace', LaunchConfiguration('namespace')),
             ('use_sim_time', LaunchConfiguration('use_sim_time'))
         ]
     )
 
+    # Save map to disk when Ctrl+C is pressed
+    # map_saver_cli reads /map (transient_local QoS) so it gets the last published map
+    # use_sim_time:=false because Gazebo is already shutting down
+    save_map = RegisterEventHandler(
+        OnShutdown(
+            on_shutdown=[
+                LogInfo(msg=['Saving map to ', LaunchConfiguration('map_save_path'), ' ...']),
+                ExecuteProcess(
+                    cmd=[
+                        'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
+                        '-f', LaunchConfiguration('map_save_path'),
+                        '--ros-args', '-p', 'use_sim_time:=false'
+                    ],
+                    output='screen'
+                )
+            ]
+        )
+    )
 
     # Create launch description and add actions
     ld = LaunchDescription(ARGUMENTS)
     ld.add_action(gazebo)
     ld.add_action(robot_spawn)
-    ld.add_action(localization)
-    ld.add_action(nav2)
+    ld.add_action(slam)
+    ld.add_action(save_map)
     return ld

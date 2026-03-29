@@ -33,7 +33,8 @@ ARGUMENTS = [
     DeclareLaunchArgument('rviz', default_value='false',choices=['true', 'false'],description='Start rviz.'),
     DeclareLaunchArgument('use_sim_time', default_value='true',choices=['true', 'false'],description='use_sim_time'),
     DeclareLaunchArgument('model', default_value='standard',choices=['standard', 'lite'],description='Turtlebot4 Model'),
-    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace')
+    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
+    DeclareLaunchArgument('world', default_value='task1_blue_demo', description='Gazebo world name (must match sim.launch.py world argument)'),
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
@@ -43,7 +44,7 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
     pkg_turtlebot4_gz_bringup = get_package_share_directory('turtlebot4_gz_bringup')
     pkg_turtlebot4_description = get_package_share_directory('turtlebot4_description')
     pkg_turtlebot4_viz = get_package_share_directory('turtlebot4_viz')
@@ -57,7 +58,7 @@ def generate_launch_description():
     turtlebot4_node_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'turtlebot4_nodes.launch.py'])
     create3_nodes_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'create3_nodes.launch.py'])
     create3_gz_nodes_launch = PathJoinSubstitution([pkg_irobot_create_gz_bringup, 'launch', 'create3_gz_nodes.launch.py'])
-    robot_description_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'robot_description.launch.py'])
+    robot_description_launch = PathJoinSubstitution([pkg_turtlebot4_description, 'launch', 'robot_description.launch.py'])
     dock_description_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'dock_description.launch.py'])
 
     # Parameters
@@ -108,7 +109,8 @@ def generate_launch_description():
             launch_arguments=[
                 ('model', LaunchConfiguration('model')),
                 ('robot_name', robot_name),
-                ('namespace', namespace)
+                ('namespace', namespace),
+                ('world', LaunchConfiguration('world')),
             ]
         ),
 
@@ -178,7 +180,7 @@ def generate_launch_description():
         executable="scan_to_scan_filter_chain",
         parameters=[
             PathJoinSubstitution([
-                pkg_dis_tutorial3,
+                pkg_dis_tutorial5,
                 "config",
                 "laser_filter_chain.yaml",
             ])

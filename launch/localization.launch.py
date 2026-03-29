@@ -31,7 +31,6 @@ ARGUMENTS = [
 ]
 
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
     pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
 
@@ -43,7 +42,7 @@ def generate_launch_description():
 
     map_arg = DeclareLaunchArgument(
         'map',
-        default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'maps.yaml']),
+        default_value='/home/erik/rins/maps/maps.yaml',
         description='Full path to map yaml file to load'
     )
 

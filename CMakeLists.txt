@@ -51,6 +51,10 @@ install(TARGETS
 )
 
 install(PROGRAMS
+  scripts/autonomous_sweep.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
   scripts/detect_rings.py
   DESTINATION lib/${PROJECT_NAME})
 

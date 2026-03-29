@@ -30,7 +30,6 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import PushRosNamespace, SetRemap
 
 
-pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
 pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
 
 ARGUMENTS = [

@@ -29,14 +29,17 @@ from launch_ros.actions import Node
 
 ARGUMENTS = [
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time'),
-    DeclareLaunchArgument('world', default_value='warehouse',  description='Simulation World'),
+    DeclareLaunchArgument('world', default_value='task1_blue_demo',
+        choices=['task1_blue_demo', 'task1_green_demo', 'task1_yellow_demo'],
+        description='Simulation World (from /home/erik/rins/worlds)'),
+    
     DeclareLaunchArgument('model', default_value='lite', choices=['standard', 'lite'], description='Turtlebot4 Model'),
 ]
 
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_dis_tutorial5 = get_package_share_directory('dis_tutorial5')
     pkg_turtlebot4_gz_bringup = get_package_share_directory('turtlebot4_gz_bringup')
     pkg_turtlebot4_gz_gui_plugins = get_package_share_directory('turtlebot4_gz_gui_plugins')
     pkg_turtlebot4_description = get_package_share_directory('turtlebot4_description')
@@ -49,7 +52,7 @@ def generate_launch_description():
     gz_resource_path = SetEnvironmentVariable(
         name='GZ_SIM_RESOURCE_PATH',
         value=':'.join([
-            os.path.join(pkg_dis_tutorial3, 'worlds'), ':' +
+            os.path.join('/home/erik/rins', 'worlds'), ':' +
             os.path.join(pkg_turtlebot4_gz_bringup, 'worlds'),
             os.path.join(pkg_irobot_create_gz_bringup, 'worlds'),
             str(Path(pkg_turtlebot4_description).parent.resolve()),

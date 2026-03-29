@@ -13,8 +13,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
+import os
 import yaml
 import json
+from datetime import datetime
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -34,6 +36,8 @@ class detect_faces(Node):
 			namespace='',
 			parameters=[
 				('device', ''),
+				('map_yaml_path', '/home/erik/rins/maps/map.yaml'),
+				('map_pgm_path', '/home/erik/rins/maps/map.pgm'),
 		])
 
 		marker_topic = "/people_marker"
@@ -58,12 +62,19 @@ class detect_faces(Node):
 		self.face_best_alignment_score = []  # tracks best combined score per face
 		# minimum distance (meters) between two detections to consider them different people
 		self.dedup_distance = 1.5
-		self.max_detection_z = 0.77
+		# max_detection_z: height in map frame (Z=up). A person's face is ~1.0–1.8 m.
+		self.max_detection_z = 2.0
 
 		# map info for saving detections to PGM
-		self.map_yaml_path = '/home/erik/rins/maps.yaml'
-		self.map_pgm_path = '/home/erik/rins/maps.pgm'
-		self.detections_json_path = '/home/erik/rins/src/dis_tutorial4/people_detections.json'
+		self.map_yaml_path = self.get_parameter('map_yaml_path').get_parameter_value().string_value
+		self.map_pgm_path = self.get_parameter('map_pgm_path').get_parameter_value().string_value
+
+		map_stem = os.path.splitext(os.path.basename(self.map_yaml_path))[0]
+		_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+		self.detections_json_path = os.path.join(
+			'/home/erik/rins/maps',
+			f'people_detections_{map_stem}._{_ts}.json'
+		)
 
 		# load previously saved detections if available
 		self.load_detections()
@@ -132,8 +143,31 @@ class detect_faces(Node):
 		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
 		a = a.reshape((height, width, 3))
 
-		# current camera frame from pointcloud message
-		camera_frame = data.header.frame_id if data.header.frame_id else "oakd_rgb_camera_optical_frame"
+		# The PointCloud2 data comes in the optical frame (X=right, Y=down, Z=forward)
+		# with frame_id = "oakd_rgb_camera_optical_frame".
+		# The system URDF (turtlebot4_description) has the CORRECT rotation
+		# rpy=(-pi/2, 0, -pi/2) for the optical→body joint, so TF2 handles the
+		# axis conversion automatically.  Pass raw XYZ directly — do NOT apply
+		# a manual opt_to_body conversion (that would double-rotate!).
+		# (The local dis_tutorial5/urdf copy has an identity rotation, but it is
+		# NOT used at runtime — the launch loads from turtlebot4_description.)
+		#
+		# detect_rings.py uses opt_to_body because it constructs optical XYZ from
+		# pixel+depth+intrinsics, so it must convert manually before handing to
+		# the body frame.  Here we read XYZ from the PointCloud2 which already
+		# has the correct frame_id for TF2 to handle.
+		source_frame = "oakd_rgb_camera_optical_frame"
+
+		# Log frame_id once for debugging
+		if not hasattr(self, '_logged_source_frame'):
+			actual_frame = data.header.frame_id if data.header.frame_id else "(empty)"
+			self.get_logger().info(
+				f"PointCloud2 frame_id='{actual_frame}', "
+				f"pointcloud size={data.height}x{data.width}, "
+				f"using source_frame='{source_frame}' for TF"
+			)
+			self._logged_source_frame = True
+			self._diag_count = 0  # count diagnostic detections
 
 		# get robot position once for normal orientation and fallback
 		robot_x = None
@@ -159,65 +193,76 @@ class detect_faces(Node):
 				self.get_logger().warn("Skipping detection with NaN depth")
 				continue
 
-			# we know that the topic for point for face is /oakd/rgb/preview/depth/points
-			# by running ros2 topic echo --once /oakd/rgb/preview/depth/points we see that datapoints come in coordinates of frame oakd_rgb_camera_optical_frame
-			# we want to get map coordinates of the face from the oakd_rgb_camera_optical_frame coordinates
-			# thus we transform point from oakd_rgb_camera_optical_frame to map frame using TF2 
+			# Transform the pointcloud XYZ directly from the optical frame to map.
+			# TF2 applies the optical→body rotation from the system URDF.
 			try:
-				# bbox corners in camera frame (numpy xyz), then transformed to map frame
-				right_corner_xyz = self.get_valid_point_around(a, x2, y)
-				left_corner_xyz = self.get_valid_point_around(a, x1, y)
-				point_in_map_right_bbox_corner = None
-				point_in_map_left_bbox_corner = None
-				if right_corner_xyz is not None:
-					point_in_map_right_bbox_corner = self.transform_point_to_map(right_corner_xyz, camera_frame)
-				if left_corner_xyz is not None:
-					point_in_map_left_bbox_corner = self.transform_point_to_map(left_corner_xyz, camera_frame)
-
-				# center in map frame
-				point_in_map = self.transform_point_to_map(d, camera_frame)
+				point_in_map = self.transform_point_to_map(d, source_frame)
 				map_x = point_in_map.point.x
 				map_y = point_in_map.point.y
 				map_z = point_in_map.point.z
+
+				# Diagnostic logging for first few detections
+				diag_count = getattr(self, '_diag_count', 0)
+				if diag_count < 5:
+					self.get_logger().info(
+						f"[DIAG {diag_count}] optical=({d[0]:.3f},{d[1]:.3f},{d[2]:.3f}) "
+						f"→ map=({map_x:.2f},{map_y:.2f},{map_z:.2f}) "
+						f"robot=({robot_x:.2f},{robot_y:.2f})" if robot_x is not None else
+						f"[DIAG {diag_count}] optical=({d[0]:.3f},{d[1]:.3f},{d[2]:.3f}) "
+						f"→ map=({map_x:.2f},{map_y:.2f},{map_z:.2f}) robot=N/A"
+					)
+					self._diag_count = diag_count + 1
 
 				if map_z > self.max_detection_z:
 					self.get_logger().warn(f"Skipping detection: center z={map_z:.2f}m exceeds max_detection_z={self.max_detection_z:.2f}m")
 					continue
 
-				# estimate wall tangent from left/right points in bbox and offset
-				# by 0.5m along the perpendicular (wall normal).
+				# Compute wall tangent from left/right bbox corners in map space,
+				# then place marker 0.5 m along the perpendicular toward the robot.
 				offset_distance = 0.5
-				normal = None
+				offset_applied = False
 				angle_of_view = None
-				
-				if robot_x is not None and robot_y is not None and map_x is not None and map_y is not None:
+				normal = None
+
+				right_corner_xyz = self.get_valid_point_around(a, x2, y)
+				left_corner_xyz  = self.get_valid_point_around(a, x1, y)
+				point_in_map_right_bbox_corner = None
+				point_in_map_left_bbox_corner  = None
+				if right_corner_xyz is not None:
+					point_in_map_right_bbox_corner = self.transform_point_to_map(right_corner_xyz, source_frame)
+				if left_corner_xyz is not None:
+					point_in_map_left_bbox_corner  = self.transform_point_to_map(left_corner_xyz, source_frame)
+				if (robot_x is not None and robot_y is not None
+						and point_in_map_right_bbox_corner is not None
+						and point_in_map_left_bbox_corner  is not None):
 					tangent_dx = point_in_map_right_bbox_corner.point.x - point_in_map_left_bbox_corner.point.x
 					tangent_dy = point_in_map_right_bbox_corner.point.y - point_in_map_left_bbox_corner.point.y
 					tangent_norm = np.sqrt(tangent_dx**2 + tangent_dy**2)
-
 					if tangent_norm > 0.01:
 						to_robot_x = robot_x - map_x
 						to_robot_y = robot_y - map_y
-
 						cross_prod = tangent_dy * to_robot_x - tangent_dx * to_robot_y
 						dot_prod   = tangent_dx * to_robot_x + tangent_dy * to_robot_y
 						angle_of_view = np.arctan2(cross_prod, dot_prod)
-						if abs(angle_of_view) > np.pi / 4:
-							# 2D perpendicular of tangent:
-							nx = -tangent_dy / tangent_norm
-							ny = tangent_dx / tangent_norm
-							dot_product = nx * to_robot_x + ny * to_robot_y
-						
-							if dot_product < 0:
-								nx = -nx
-								ny = -ny
+						nx = -tangent_dy / tangent_norm
+						ny =  tangent_dx / tangent_norm
+						if nx * to_robot_x + ny * to_robot_y < 0:
+							nx, ny = -nx, -ny
+						normal = (nx, ny)
 
-							normal = (nx, ny)
+						# Apply 0.5 m offset along wall perpendicular
+						map_x += nx * offset_distance
+						map_y += ny * offset_distance
+						offset_applied = True
 
-				if normal is not None:
-					map_x += normal[0] * offset_distance
-					map_y += normal[1] * offset_distance
-
+				# Fallback: offset toward robot if wall tangent couldn't be computed
+				if not offset_applied and robot_x is not None and robot_y is not None:
+					to_robot_dx = robot_x - map_x
+					to_robot_dy = robot_y - map_y
+					to_robot_dist = np.sqrt(to_robot_dx**2 + to_robot_dy**2)
+					if to_robot_dist > 0.01:
+						map_x += (to_robot_dx / to_robot_dist) * offset_distance
+						map_y += (to_robot_dy / to_robot_dist) * offset_distance
 				dist_to_face = 100.0
 				# compute combined alignment score for this observation
 				combined_score = 0.0
