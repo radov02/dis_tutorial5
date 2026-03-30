@@ -1,51 +1,22 @@
 #!/usr/bin/env python3
-"""
-map_geofence_tool.py
---------------------
-Two utilities for setting the ALLOWED_AREA_POLYGON geofence in robot_commander.py.
-
-Usage
------
-  # 1. Print map coordinate info only:
-  python3 map_geofence_tool.py --info
-
-  # 2. Open interactive plot – click vertices, press Enter to finish, copy output:
-  python3 map_geofence_tool.py
-
-  # 3. Preview current polygon AND allow editing it:
-  python3 map_geofence_tool.py --preview
-
-  # 4. Auto-patch robot_commander.py after defining the polygon:
-  python3 map_geofence_tool.py --apply
-
-The script auto-locates maps.yaml / maps.pgm from /home/erik/rins/maps/,
-or you can pass --map /path/to/maps.yaml explicitly.
-"""
 
 import argparse
 import math
 import re
-import os
 import sys
 from pathlib import Path
-
-import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 import yaml
 
-# ---------------------------------------------------------------------------
-# Default paths (adjust if your checkout is elsewhere)
-# ---------------------------------------------------------------------------
+# defaults:
 DEFAULT_YAML = Path('/home/erik/rins/maps/maps.yaml')
-# Fallback: look next to this script
 _ALT_YAML    = Path(__file__).resolve().parent / "maps/maps.yaml"
-
-# Path to robot_commander.py for --apply mode
 COMMANDER_PY = Path(__file__).resolve().parent / "robot_commander.py"
-
-# The polygon that is currently in robot_commander.py (for --preview mode)
+GEOFENCE_SCRIPTS: list[Path] = [
+    Path(__file__).resolve().parent / "autonomous_sweep.py",
+    Path(__file__).resolve().parent / "halfautonomous_search.py",
+]
 CURRENT_POLYGON: list[tuple[float, float]] = [
     (-8.0, -8.5),
     ( 0.0, -8.5),
@@ -53,19 +24,15 @@ CURRENT_POLYGON: list[tuple[float, float]] = [
     (-8.0,  8.5),
 ]
 
-# ---------------------------------------------------------------------------
-# Helper: parse_map
-# ---------------------------------------------------------------------------
-
 def parse_map(yaml_path: str) -> dict:
     """
     Read a ROS map YAML + the referenced PGM/PNG and return a dict with:
-      origin_x, origin_y  – map origin in metres (bottom-left corner)
-      resolution           – metres per pixel
-      width, height        – image size in pixels
-      world_x_min/max, world_y_min/max  – world-coordinate extents
-      image                – H×W numpy array (grayscale, 0-255)
-      pgm_path             – resolved path to the image file
+      origin_x, origin_y  - map origin in metres (bottom-left corner)
+      resolution           - metres per pixel
+      width, height        - image size in pixels
+      world_x_min/max, world_y_min/max  - world-coordinate extents
+      image                - HxW numpy array (grayscale, 0-255)
+      pgm_path             - resolved path to the image file
     """
     yaml_path = Path(yaml_path).resolve()
     with open(yaml_path) as f:
@@ -113,56 +80,48 @@ def print_map_info(m: dict):
     print("=" * 55)
     print("MAP COORDINATE INFORMATION")
     print("=" * 55)
-    print(f"  Image size   : {m['width']} × {m['height']} px")
+    print(f"  Image size   : {m['width']} x {m['height']} px")
     print(f"  Resolution   : {m['resolution']} m/px")
     print(f"  Origin       : ({m['origin_x']:.4f}, {m['origin_y']:.4f})  [bottom-left]")
-    print(f"  X range      : {m['world_x_min']:.4f}  →  {m['world_x_max']:.4f}  m")
-    print(f"  Y range      : {m['world_y_min']:.4f}  →  {m['world_y_max']:.4f}  m")
+    print(f"  X range      : {m['world_x_min']:.4f}  ->  {m['world_x_max']:.4f}  m")
+    print(f"  Y range      : {m['world_y_min']:.4f}  ->  {m['world_y_max']:.4f}  m")
     print(f"  Map image    : {m['pgm_path']}")
     print("=" * 55)
 
 
-# ---------------------------------------------------------------------------
-# Coordinate helpers
-# ---------------------------------------------------------------------------
-
 def world_to_pixel(m: dict, wx: float, wy: float) -> tuple[float, float]:
-    """World (wx, wy) → image (col, row).  Row 0 = top = y_max."""
+    """World (wx, wy) -> image (col, row).  Row 0 = top = y_max."""
     col = (wx - m["origin_x"]) / m["resolution"]
     row = m["height"] - 1 - (wy - m["origin_y"]) / m["resolution"]
     return col, row
 
 
 def pixel_to_world(m: dict, col: float, row: float) -> tuple[float, float]:
-    """Image (col, row) → world (wx, wy)."""
+    """Image (col, row) -> world (wx, wy)."""
     wx = m["origin_x"] + col * m["resolution"]
     wy = m["origin_y"] + (m["height"] - 1 - row) * m["resolution"]
     return wx, wy
 
 
-# ---------------------------------------------------------------------------
-# Interactive polygon tool
-# ---------------------------------------------------------------------------
-
 def interactive_geofence(m: dict, initial_polygon=None, apply_to_file: Path | None = None):
     """
     Opens a matplotlib window showing the map.
-    • Left-click   – add a vertex (orange dot + coordinate label)
-    • Backspace    – remove the last vertex
-    • Right-click  – print coordinates of that point without adding a vertex
-    • Enter        – finish: print the ALLOWED_AREA_POLYGON snippet (and patch
+    - Left-click   - add a vertex (orange dot + coordinate label)
+    - Backspace    - remove the last vertex
+    - Right-click  - print coordinates of that point without adding a vertex
+    - Enter        - finish: print the ALLOWED_AREA_POLYGON snippet (and patch
                      robot_commander.py if apply_to_file is set)
-    • Escape       – quit without output
+    - Escape       - quit without output
     """
     print_map_info(m)
     print()
     print("INTERACTIVE GEOFENCE EDITOR")
-    print("  Left-click   – add a vertex")
-    print("  Backspace    – remove last vertex")
-    print("  Enter        – finish & print polygon" +
+    print("  Left-click   - add a vertex")
+    print("  Backspace    - remove last vertex")
+    print("  Enter        - finish & print polygon" +
           (" + patch robot_commander.py" if apply_to_file else ""))
-    print("  Right-click  – print coords (no vertex added)")
-    print("  Escape       – quit")
+    print("  Right-click  - print coords (no vertex added)")
+    print("  Escape       - quit")
     if initial_polygon:
         print(f"\n  Loaded {len(initial_polygon)} existing vertices. Edit as needed.")
     print()
@@ -258,7 +217,7 @@ def interactive_geofence(m: dict, initial_polygon=None, apply_to_file: Path | No
         wx, wy = event.xdata, event.ydata
         if wx is None:
             return
-        if event.button == 3:   # right-click → report coords only
+        if event.button == 3:   # right-click -> report coords only
             print(f"  Probe: ({wx:.3f}, {wy:.3f})")
             return
         if event.button == 1:
@@ -269,7 +228,7 @@ def interactive_geofence(m: dict, initial_polygon=None, apply_to_file: Path | No
     def on_key(event):
         if event.key in ("enter", "return"):
             if len(vertices) < 3:
-                print("Need at least 3 vertices – keep clicking.")
+                print("Need at least 3 vertices - keep clicking.")
                 return
             snippet = polygon_snippet(vertices)
             print(snippet)
@@ -284,7 +243,7 @@ def interactive_geofence(m: dict, initial_polygon=None, apply_to_file: Path | No
             else:
                 print("  (no vertices to remove)")
         elif event.key == "escape":
-            print("Cancelled – no output written.")
+            print("Cancelled - no output written.")
             plt.close(fig)
 
     fig.canvas.mpl_connect("button_press_event", on_click)
@@ -330,7 +289,7 @@ def patch_robot_commander(filepath: Path, vertices: list[tuple[float, float]]):
         re.DOTALL,
     )
     if not pattern.search(src):
-        print("  [apply] Could not locate ALLOWED_AREA_POLYGON in file – paste manually.")
+        print("  [apply] Could not locate ALLOWED_AREA_POLYGON in file - paste manually.")
         return
 
     new_src = pattern.sub(new_block, src)
@@ -339,9 +298,31 @@ def patch_robot_commander(filepath: Path, vertices: list[tuple[float, float]]):
     print("  Rebuild with: cd /home/erik/rins && colcon build --packages-select dis_tutorial5 --symlink-install")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def patch_geofence_enabled(enabled: bool, filepaths: list[Path] | None = None):
+    """Set GEOFENCE_ENABLED = True/False in each target script."""
+    if filepaths is None:
+        filepaths = GEOFENCE_SCRIPTS
+    pattern = re.compile(r"^GEOFENCE_ENABLED\s*:\s*bool\s*=\s*(True|False)", re.MULTILINE)
+    value_str = "True" if enabled else "False"
+    rebuild_needed = False
+    for fp in filepaths:
+        if not fp.exists():
+            print(f"  [geofence] File not found: {fp}")
+            continue
+        src = fp.read_text()
+        if not pattern.search(src):
+            print(f"  [geofence] Could not locate GEOFENCE_ENABLED in {fp.name} - skipping.")
+            continue
+        new_src = pattern.sub(f"GEOFENCE_ENABLED: bool = {value_str}", src)
+        if new_src == src:
+            print(f"  [geofence] {fp.name}: already {'enabled' if enabled else 'disabled'}, no change.")
+        else:
+            fp.write_text(new_src)
+            print(f"  [geofence] {fp.name}: geofencing {'ENABLED' if enabled else 'DISABLED'}.")
+            rebuild_needed = True
+    if rebuild_needed:
+        print("  Rebuild with: cd /home/erik/rins && colcon build --packages-select dis_tutorial5 --symlink-install")
+
 
 def find_yaml(explicit: str | None) -> str:
     if explicit:
@@ -362,7 +343,16 @@ def main():
     parser.add_argument("--info",    action="store_true", help="Print map coordinate info and exit (no plot)")
     parser.add_argument("--preview", action="store_true", help="Load current CURRENT_POLYGON for editing")
     parser.add_argument("--apply",   action="store_true", help="Auto-patch robot_commander.py after Enter")
+    parser.add_argument("--turnoff", action="store_true", help="Disable geofencing in autonomous_sweep.py and halfautonomous_search.py")
+    parser.add_argument("--turnon",  action="store_true", help="Re-enable geofencing in autonomous_sweep.py and halfautonomous_search.py")
     args = parser.parse_args()
+
+    if args.turnoff:
+        patch_geofence_enabled(False)
+        return
+    if args.turnon:
+        patch_geofence_enabled(True)
+        return
 
     yaml_path = find_yaml(args.map)
     m = parse_map(yaml_path)

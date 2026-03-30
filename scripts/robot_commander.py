@@ -75,6 +75,7 @@ GLOBAL_COST_THRESHOLD = 20         # cells with cost strictly below this are can
 LOCAL_OBSTACLE_THRESHOLD = 65      # local costmap cost above this = unexpected obstacle
 VIEWPOINT_GRID_STEP_M = 0.4       # spacing between sampled viewpoints (metres)
 RING_DEDUP_DISTANCE_M = 0.5       # merge ring detections closer than this (metres)
+COSTMAP_SAFETY_THRESHOLD = 80      # local costmap cost triggering 180° turn
 
 
 class RobotCommander(Node):
@@ -489,6 +490,22 @@ class RobotCommander(Node):
         # iRobot Create 3 cliff / IR drop sensor (adjust topic if needed)
         self.create_subscription(Range, 'ir_intensity_side_left', self._cliffCallback, qos_profile_sensor_data)
 
+        # Face detection subscriber
+        self._face_detections = []
+        self.create_subscription(
+            MarkerArray, "/detected_faces", self._detected_faces_callback,
+            QoSProfile(
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1))
+
+        # Pending detection queues (for priority-based approach during nav)
+        self._pending_ring_inspect = []
+        self._pending_face_approach = []
+        self._inspected_rings = set()
+        self._approached_faces = set()
+
     def _globalCostmapCallback(self, msg: OccupancyGrid):
         self._global_costmap = msg
 
@@ -500,6 +517,35 @@ class RobotCommander(Node):
         # Tune this threshold to match your floor/table edge height.
         DROP_RANGE_THRESHOLD = 0.05   # metres
         self._cliff_detected = msg.range < DROP_RANGE_THRESHOLD
+
+    def _get_robot_local_costmap_cost(self) -> int:
+        """Return the max local costmap cost in a small radius around the robot.
+        Returns 0 if costmap not available."""
+        if self._local_costmap is None or not hasattr(self, 'current_pose'):
+            return 0
+        lc = self._local_costmap
+        grid = np.array(lc.data, dtype=np.int8).reshape(
+            (lc.info.height, lc.info.width))
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        res = lc.info.resolution
+        ox = lc.info.origin.position.x
+        oy = lc.info.origin.position.y
+        col = int((rx - ox) / res)
+        row = int((ry - oy) / res)
+        h, w = grid.shape
+        radius_cells = max(1, int(0.25 / res))
+        max_cost = 0
+        for dr in range(-radius_cells, radius_cells + 1):
+            for dc in range(-radius_cells, radius_cells + 1):
+                if dr * dr + dc * dc > radius_cells * radius_cells:
+                    continue
+                r, c = row + dr, col + dc
+                if 0 <= r < h and 0 <= c < w:
+                    cost = int(grid[r, c])
+                    if cost > max_cost:
+                        max_cost = cost
+        return max_cost
     
     def create_marker(self, point_stamped, marker_id, lifetime=180.0):
         """You can see the description of the Marker message here: https://docs.ros2.org/galactic/api/visualization_msgs/msg/Marker.html"""
@@ -534,43 +580,23 @@ class RobotCommander(Node):
     
     def timer_callback(self):
         # Create a PointStamped in the /base_link frame of the robot
-        # The point is located 0.1m in from of the robot
-        # "Stamped" means that the message type contains a Header
         point_in_robot_frame = PointStamped()
         point_in_robot_frame.header.frame_id = "/base_link"
         point_in_robot_frame.header.stamp = self.get_clock().now().to_msg()
-
         point_in_robot_frame.point.x = -0.1
         point_in_robot_frame.point.y = 0.
         point_in_robot_frame.point.z = 0.
 
-        # Now we look up the transform between the base_link and the map frames
-        # and then we apply it to our PointStamped
         time_now = rclpy.time.Time()
         timeout = RclpyDuration(seconds=0.1)
         try:
-            # An example of how you can get a transform from /base_link frame to the /map frame
-            # as it is at time_now, wait for timeout for it to become available
             trans = self.tf_buffer.lookup_transform("map", "base_link", time_now, timeout)
-            self.get_logger().info(f"Looks like the transform is available.")
-
-            # Now we apply the transform to transform the point_in_robot_frame to the map frame
-            # The header in the result will be copied from the Header of the transform
             point_in_map_frame = tfg.do_transform_point(point_in_robot_frame, trans)
-            self.get_logger().info(f"We transformed a PointStamped!")
-
-            # If the transformation exists, create a marker from the point, in order to visualize it in Rviz
             marker_in_map_frame = self.create_marker(point_in_map_frame, self.marker_id)
-
-            # Publish the marker
             self.marker_pub.publish(marker_in_map_frame)
-            self.get_logger().info(f"The marker has been published to /breadcrumbs (location: {point_in_map_frame.point}). You are able to visualize it in Rviz")
-
-            # Increase the marker_id, so we dont overwrite the same marker.
             self.marker_id += 1
-
-        except TransformException as te:
-            self.get_logger().info(f"Cound not get the transform: {te}")
+        except TransformException:
+            pass
 
     def _costmap_to_numpy(self, costmap: OccupancyGrid) -> np.ndarray:
         """Return a 2D int8 array (row, col) from a flat OccupancyGrid data list."""
@@ -733,27 +759,76 @@ class RobotCommander(Node):
     def _detected_rings_callback(self, msg: MarkerArray):
         """Sync local ring list with the authoritative MarkerArray from detect_rings.
 
-        detect_rings already handles deduplication and running-average position
-        updates, so we simply mirror its current state rather than trying to
-        re-add markers individually (which would accumulate duplicates as the
-        running-average positions drift slightly across publishes).
+        Parses extended marker text: "color|eccentricity|wall_normal_angle"
+        and queues new rings for inspection during autonomous search.
         """
         fresh = []
         for marker in msg.markers:
             x = marker.pose.position.x
             y = marker.pose.position.y
             z = marker.pose.position.z
-            color_name = marker.text if marker.text else "unknown"
+            # Parse extended text: "color|eccentricity|wall_normal_angle"
+            text_parts = (marker.text or "unknown").split("|")
+            color_name = text_parts[0] if text_parts else "unknown"
+            try:
+                eccentricity = float(text_parts[1]) if len(text_parts) > 1 and text_parts[1] else 0.0
+            except (ValueError, IndexError):
+                eccentricity = 0.0
+            try:
+                wall_normal_angle = float(text_parts[2]) if len(text_parts) > 2 and text_parts[2] else None
+            except (ValueError, IndexError):
+                wall_normal_angle = None
+
             if math.isnan(x) or math.isnan(y):
                 continue
             if not self._is_in_allowed_area(x, y):
-                self.warn(f"Ring at ({x:.2f}, {y:.2f}) outside allowed area – ignoring.")
                 continue
-            fresh.append((x, y, z, color_name))
+            fresh.append((x, y, z, color_name, eccentricity, wall_normal_angle))
 
-        if len(fresh) != len(self.ring_detections):
-            self.ring_detections = fresh
+        old_count = len(self.ring_detections)
+        self.ring_detections = fresh
+        if len(fresh) != old_count:
             self.info(f"Ring list updated: {len(self.ring_detections)} ring(s) known.")
+
+        # Queue NEW rings for inspection (during autonomous search)
+        if hasattr(self, '_inspected_rings'):
+            for det in fresh:
+                rx, ry = det[0], det[1]
+                key = (round(rx, 1), round(ry, 1))
+                if key not in self._inspected_rings:
+                    already_queued = any(
+                        math.hypot(rx - q[0], ry - q[1]) < 0.5
+                        for q in self._pending_ring_inspect)
+                    if not already_queued:
+                        self._pending_ring_inspect.append(det)
+                        self.get_logger().info(
+                            f"\n\n--- RING QUEUED: {det[3]} at ({rx:.2f}, {ry:.2f}) ---\n")
+
+    def _detected_faces_callback(self, msg: MarkerArray):
+        """Mirror current face detections and queue new ones for approach."""
+        fresh = []
+        for marker in msg.markers:
+            x = marker.pose.position.x
+            y = marker.pose.position.y
+            z = marker.pose.position.z
+            if math.isnan(x) or math.isnan(y):
+                continue
+            fresh.append((x, y, z))
+
+        self._face_detections = fresh
+
+        # Queue NEW faces for approach
+        if hasattr(self, '_approached_faces'):
+            for (fx, fy, fz) in fresh:
+                key = (round(fx, 1), round(fy, 1))
+                if key not in self._approached_faces:
+                    already_queued = any(
+                        math.hypot(fx - q[0], fy - q[1]) < 0.5
+                        for q in self._pending_face_approach)
+                    if not already_queued:
+                        self._pending_face_approach.append((fx, fy, fz))
+                        self.get_logger().info(
+                            f"\n\n--- FACE QUEUED at ({fx:.2f}, {fy:.2f}) ---\n")
 
     # ---- accumulation & persistence ----
 
@@ -767,13 +842,14 @@ class RobotCommander(Node):
         for ex in self.ring_detections:
             if math.sqrt((x - ex[0])**2 + (y - ex[1])**2) < RING_DEDUP_DISTANCE_M:
                 return  # duplicate
-        self.ring_detections.append((x, y, z, color_name))
+        self.ring_detections.append((x, y, z, color_name, 0.0, None))
         self.info(f"New ring detected! colour={color_name}  pos=({x:.2f}, {y:.2f}, {z:.2f})  total={len(self.ring_detections)}")
 
     def save_ring_detections(self, filepath):
         """Persist ring detections to a JSON file."""
-        data = [{"x": x, "y": y, "z": z, "color": color}
-                for x, y, z, color in self.ring_detections]
+        data = [{"x": det[0], "y": det[1], "z": det[2],
+                 "color": det[3] if len(det) > 3 else "unknown"}
+                for det in self.ring_detections]
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
         self.info(f"Saved {len(self.ring_detections)} ring detections to {filepath}")
@@ -797,10 +873,11 @@ class RobotCommander(Node):
             self.info("No ring detections to visit.")
             return
 
-        RING_STANDOFF_M = 0.15  # stop this far from the ring and face it
+        RING_STANDOFF_M = 0.0  # approach directly
 
         # Filter out invalid coordinates
-        remaining = [(x, y, z, c) for x, y, z, c in rings if not (math.isnan(x) or math.isnan(y))]
+        remaining = [(r[0], r[1], r[2], r[3] if len(r) > 3 else "unknown")
+                     for r in rings if not (math.isnan(r[0]) or math.isnan(r[1]))]
         visited: set[tuple[float, float]] = set()
         total = len(remaining)
 
@@ -862,6 +939,162 @@ class RobotCommander(Node):
 
         self.info("Finished visiting all rings.")
 
+    # ---- detection approach helpers (aligned with halfautonomous_search) ----
+
+    def _approach_face(self, x, y, z, stop_distance=0.0):
+        """Navigate to a detected face position."""
+        if math.isnan(x) or math.isnan(y):
+            return
+        key = (round(x, 1), round(y, 1))
+        if key in self._approached_faces:
+            return
+
+        cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+        cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+        dx, dy = x - cur_x, y - cur_y
+        dist = math.hypot(dx, dy)
+
+        if dist > stop_distance and stop_distance > 0:
+            goal_x = x - (dx / dist) * stop_distance
+            goal_y = y - (dy / dist) * stop_distance
+        else:
+            goal_x, goal_y = x, y
+
+        yaw = math.atan2(y - goal_y, x - goal_x) if stop_distance > 0 else math.atan2(dy, dx)
+
+        self.get_logger().info(
+            f"\n\n=== APPROACHING FACE at ({x:.2f}, {y:.2f}) ===\n")
+
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = goal_x
+        pose.pose.position.y = goal_y
+        pose.pose.orientation = self.YawToQuaternion(yaw)
+
+        if not self.goToPose(pose):
+            self.warn(f"Face approach goal rejected for ({x:.2f}, {y:.2f})")
+            return
+
+        deadline = time.time() + 60.0
+        while not self.isTaskComplete():
+            time.sleep(0.5)
+            if time.time() > deadline:
+                self.warn("Face approach timed out; cancelling.")
+                self.cancelTask()
+                break
+
+        self._approached_faces.add(key)
+        result = self.getResult()
+        if result == TaskResult.SUCCEEDED:
+            self.get_logger().info(f"Reached face at ({x:.2f}, {y:.2f})")
+            # Trigger voice interaction
+            prefetch_result = self.trigger_voice_interaction(prefetching=True)
+            if prefetch_result:
+                self.trigger_voice_interaction(prefetching=False)
+        else:
+            self.warn(f"Failed to reach face at ({x:.2f}, {y:.2f}): {result}")
+
+    def _inspect_ring(self, x, y, z, color="unknown", eccentricity=0.0,
+                      wall_normal_angle=None, radius=0.0):
+        """Navigate to a detected ring, using wall_normal_angle for head-on approach
+        when eccentricity is high (ring viewed at an angle)."""
+        if math.isnan(x) or math.isnan(y):
+            return
+        key = (round(x, 1), round(y, 1))
+        if key in self._inspected_rings:
+            return
+
+        cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+        cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+
+        # Use wall_normal_angle for approach direction when ring is skewed
+        if wall_normal_angle is not None and eccentricity > 0.15:
+            wna_rad = math.radians(wall_normal_angle)
+            approach_dist = max(radius, 0.3)
+            goal_x = x + math.cos(wna_rad) * approach_dist
+            goal_y = y + math.sin(wna_rad) * approach_dist
+            yaw = math.atan2(y - goal_y, x - goal_x)
+        else:
+            dx, dy = x - cur_x, y - cur_y
+            dist = math.hypot(dx, dy)
+            if dist > radius and radius > 0:
+                goal_x = x - (dx / dist) * radius
+                goal_y = y - (dy / dist) * radius
+            else:
+                goal_x, goal_y = x, y
+            yaw = math.atan2(y - goal_y, x - goal_x) if radius > 0 else math.atan2(dy, dx)
+
+        self.get_logger().info(
+            f"\n\n=== INSPECTING {color.upper()} RING at ({x:.2f}, {y:.2f}) ecc={eccentricity:.2f} ===\n")
+
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = goal_x
+        pose.pose.position.y = goal_y
+        pose.pose.orientation = self.YawToQuaternion(yaw)
+
+        if not self.goToPose(pose):
+            self.warn(f"Ring inspection goal rejected for {color} at ({x:.2f}, {y:.2f})")
+            return
+
+        deadline = time.time() + 60.0
+        while not self.isTaskComplete():
+            time.sleep(0.5)
+            if time.time() > deadline:
+                self.warn("Ring inspection timed out; cancelling.")
+                self.cancelTask()
+                break
+
+        self._inspected_rings.add(key)
+        result = self.getResult()
+        if result == TaskResult.SUCCEEDED:
+            self.get_logger().info(f"Reached {color} ring at ({x:.2f}, {y:.2f})")
+        else:
+            self.warn(f"Failed to reach {color} ring at ({x:.2f}, {y:.2f}): {result}")
+
+    def _process_pending_detections(self, goal_x=None, goal_y=None):
+        """Process pending ring inspections and face approaches.
+        If goal_x, goal_y given, only process detections closer to robot than the goal."""
+        cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+        cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+
+        if goal_x is not None and goal_y is not None:
+            goal_dist = math.hypot(goal_x - cur_x, goal_y - cur_y)
+        else:
+            goal_dist = float('inf')
+
+        # Process faces
+        faces_now = []
+        faces_later = []
+        for f in self._pending_face_approach:
+            if math.hypot(f[0] - cur_x, f[1] - cur_y) < goal_dist:
+                faces_now.append(f)
+            else:
+                faces_later.append(f)
+        self._pending_face_approach = faces_later
+
+        for f in faces_now:
+            self._approach_face(f[0], f[1], f[2])
+
+        # Process rings
+        rings_now = []
+        rings_later = []
+        for r in self._pending_ring_inspect:
+            if math.hypot(r[0] - cur_x, r[1] - cur_y) < goal_dist:
+                rings_now.append(r)
+            else:
+                rings_later.append(r)
+        self._pending_ring_inspect = rings_later
+
+        for r in rings_now:
+            self._inspect_ring(
+                r[0], r[1], r[2],
+                color=r[3] if len(r) > 3 else "unknown",
+                eccentricity=r[4] if len(r) > 4 else 0.0,
+                wall_normal_angle=r[5] if len(r) > 5 else None)
+
     def find_people_and_rings_autonomously(self):
         """sweep the robot's perception circle across the global costmap cells that have cost < `GLOBAL_COST_THRESHOLD` 
         by navigating to each candidate viewpoint (skipping those that have cliff or newly placed obstacle)"""
@@ -922,6 +1155,9 @@ class RobotCommander(Node):
             if not self._is_local_costmap_clear(wx, wy):
                 continue
 
+            # Pre-nav: process any pending detections closer than this goal
+            self._process_pending_detections(goal_x=wx, goal_y=wy)
+
             # 4. Navigate to viewpoint ----------------------------------------
             goal = PoseStamped()
             goal.header.frame_id = 'map'
@@ -934,18 +1170,53 @@ class RobotCommander(Node):
             yaw = math.atan2(dy, dx)
             goal.pose.orientation = self.YawToQuaternion(yaw)
 
+            self.get_logger().info(
+                f"\n\n--- Navigating to viewpoint ({wx:.2f}, {wy:.2f}) ---\n")
+
             if not self.goToPose(goal):
                 self.warn(f"Goal ({wx:.2f}, {wy:.2f}) rejected by Nav2; skipping.")
                 continue
 
             while not self.isTaskComplete():
-                # Re-check safety while navigating
-                time.sleep(0.1)   # callbacks processed by background executor
+                time.sleep(0.2)
+
+                # Costmap safety: 180° turn if cost > threshold
+                cost = self._get_robot_local_costmap_cost()
+                if cost > COSTMAP_SAFETY_THRESHOLD:
+                    self.get_logger().info(
+                        f"\n\n!!! HIGH COSTMAP COST ({cost}) - executing 180° turn !!!\n")
+                    self.cancelTask()
+                    time.sleep(0.5)
+                    self.spin(math.pi, 15)
+                    while not self.isTaskComplete():
+                        time.sleep(0.2)
+                    break
+
+                # Cliff / obstacle safety
                 if not self._is_cliff_safe() or not self._is_local_costmap_clear(wx, wy):
                     self.warn("Safety condition triggered mid-navigation; cancelling goal.")
                     self.cancelTask()
                     break
-                time.sleep(0.1)
+
+                # Priority-based detection interrupt
+                if self._pending_ring_inspect or self._pending_face_approach:
+                    cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+                    cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+                    goal_dist = math.hypot(wx - cur_x, wy - cur_y)
+
+                    closest_det = float('inf')
+                    for det in self._pending_face_approach + self._pending_ring_inspect:
+                        d = math.hypot(det[0] - cur_x, det[1] - cur_y)
+                        if d < closest_det:
+                            closest_det = d
+
+                    if closest_det < goal_dist:
+                        self.get_logger().info(
+                            f"\n--- Detection closer ({closest_det:.2f}m) than goal ({goal_dist:.2f}m) - interrupting ---\n")
+                        self.cancelTask()
+                        time.sleep(0.5)
+                        self._process_pending_detections(goal_x=wx, goal_y=wy)
+                        break
 
             if self.getResult() != TaskResult.SUCCEEDED:
                 self.warn(f"Navigation to ({wx:.2f}, {wy:.2f}) did not succeed ({self.getResult()}); skipping.")
@@ -964,10 +1235,15 @@ class RobotCommander(Node):
             #    detect_rings node publishing to /detected_rings.
             self.info(f"Covered viewpoint ({wx:.2f}, {wy:.2f}) - rings so far: {len(self.ring_detections)}")
 
-        self.info(f"Autonomous search complete. Detected {len(self.ring_detections)} ring(s).")
+        self.info(f"Autonomous search complete. Detected {len(self.ring_detections)} ring(s), "
+                  f"{len(self._face_detections)} face(s).")
 
-        # Save ring detections to JSON (same approach as person detections)
-        ring_detections_path = '/home/erik/rins/src/dis_tutorial5/ring_detections.json'
+        # Save ring detections to the maps folder
+        from datetime import datetime as _dt
+        _ts = _dt.now().strftime('%Y-%m-%d_%H.%M.%S')
+        _save_dir = os.path.join('/home/erik/rins/maps', f'autonomous_{_ts}')
+        os.makedirs(_save_dir, exist_ok=True)
+        ring_detections_path = os.path.join(_save_dir, 'ring_detections.json')
         self.save_ring_detections(ring_detections_path)
 
 
@@ -1021,8 +1297,8 @@ class RobotCommander(Node):
         self.info(f"Navigating to {len(targets)} target(s) (greedy closest-first)...")
         remaining = list(targets)
         visited: set[tuple[float, float]] = set()
-        PERSON_STANDOFF_M = 0.08
-        RING_STANDOFF_M = 0.08
+        PERSON_STANDOFF_M = 0.0
+        RING_STANDOFF_M = 0.0
         # Fallback standoff distances tried in order when Nav2 aborts
         STANDOFF_FALLBACKS = [0.8, 1.2]
 

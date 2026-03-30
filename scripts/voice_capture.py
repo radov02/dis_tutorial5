@@ -24,15 +24,12 @@ class VoiceNode(Node):
     def __init__(self):
         super().__init__('voice_node')
         self.callback_group = ReentrantCallbackGroup()
-        self.srv = self.create_service(HumanDetected,'human_detected', self.handle_human_detected, callback_group=self.callback_group,)
+        self.srv = self.create_service(HumanDetected,'human_detected', self._handle_human_detected, callback_group=self.callback_group,)
         self.llm_client = self.create_client(LLMQuery,'llm_inference', callback_group=self.callback_group,)
         self.llm_service_wait_timeout = 5.0
         self.llm_response_timeout = 12.0
         self.default_greeting = 'Hello! I hope you are doing well today.'
-        self.greeting_prompt = (
-            'Reply with exactly one short friendly greeting to a factory worker that you met. You know the worker. Be creative.'
-            'No quotes. Maximum 12 words.'
-        )
+        self.greeting_prompt = ('Reply with exactly one short friendly greeting to a factory worker that you met. You know the worker. Be creative. No quotes. Maximum 12 words.')
         self.cached_greeting = None
 
         self.declare_parameter('piper_model_path', '~/piper_models/en_US-lessac-medium/en_US-lessac-medium.onnx')
@@ -46,7 +43,7 @@ class VoiceNode(Node):
         else:
             self.get_logger().warn('Piper model path is invalid. Set parameter "piper_model_path" to a valid .onnx model file to enable TTS.')
 
-    def speak(self, text):
+    def _speak(self, text):
         if self.voice is None:
             self.get_logger().warn('TTS skipped: Piper model is not loaded.')
             return False
@@ -101,22 +98,16 @@ class VoiceNode(Node):
                 except Exception:
                     pass
 
-    def capture_voice(self):
-        # Simulate voice capture and conversion to text
-        simulated_text = "Hello, how are you?"
-        self.get_logger().info(f'Captured voice: {simulated_text}')
-        return simulated_text
-
-    def sanitize_response_text(self, text):
+    def _clean_text(self, text):
         cleaned = text.strip()
         if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
             cleaned = cleaned[1:-1].strip()
         return cleaned or self.default_greeting
 
-    def response_callback(self, msg):
+    def _response_callback(self, msg):
         self.get_logger().info(f'LLM Response: {msg.data}')
 
-    def get_llm_response(self, prompt):
+    def _get_llm_response(self, prompt):
         if not self.llm_client.wait_for_service(timeout_sec=self.llm_service_wait_timeout):
             self.get_logger().warn(f'LLM service unavailable after {self.llm_service_wait_timeout:.1f}s, using fallback response.')
             return self.default_greeting
@@ -144,16 +135,16 @@ class VoiceNode(Node):
             self.get_logger().warn('LLM returned an empty response, using fallback response.')
             return self.default_greeting
 
-        return self.sanitize_response_text(llm_result.response)
+        return self._clean_text(llm_result.response)
 
-    def handle_human_detected(self, request, response):
+    def _handle_human_detected(self, request, response):
         if request.prefetching:
             self.get_logger().info('Human detected: prefetching LLM greeting only.')
             if self.cached_greeting is None:
                 self.get_logger().info('Generating greeting with LLM...')
                 varied_prompt = f'{self.greeting_prompt} Variation token: {time.time_ns() % 1000000}.'
-                llm_response = self.get_llm_response(varied_prompt)
-                self.cached_greeting = self.sanitize_response_text(llm_response)
+                llm_response = self._get_llm_response(varied_prompt)
+                self.cached_greeting = self._clean_text(llm_response)
             else:
                 self.get_logger().info('Using cached greeting.')
 
@@ -165,11 +156,11 @@ class VoiceNode(Node):
         if self.cached_greeting is None:
             self.get_logger().warn('No cached greeting available, generating now.')
             varied_prompt = f'{self.greeting_prompt} Variation token: {time.time_ns() % 1000000}.'
-            llm_response = self.get_llm_response(varied_prompt)
-            self.cached_greeting = self.sanitize_response_text(llm_response)
+            llm_response = self._get_llm_response(varied_prompt)
+            self.cached_greeting = self._clean_text(llm_response)
 
         self.get_logger().info(f'Greeting to play: {self.cached_greeting}')
-        playback_succeeded = self.speak(self.cached_greeting)
+        playback_succeeded = self._speak(self.cached_greeting)
         response.response_text = self.cached_greeting if playback_succeeded else ''
         self.cached_greeting = None
 

@@ -85,8 +85,7 @@ class detect_faces(Node):
 		self.map_pgm_path = self.get_parameter('map_pgm_path').get_parameter_value().string_value
 
 		map_stem = os.path.splitext(os.path.basename(self.map_yaml_path))[0]
-		_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-		_subfolder = os.path.join('/home/erik/rins/maps', _ts)
+		_subfolder = self._get_or_create_map_subfolder(map_stem)
 		os.makedirs(_subfolder, exist_ok=True)
 		self.detections_json_path = os.path.join(
 			_subfolder,
@@ -105,6 +104,45 @@ class detect_faces(Node):
 
 		self.get_logger().info(f"Node has been initialized! Will publish face markers to {marker_topic}.")
 
+	def _get_or_create_map_subfolder(self, map_stem: str) -> str:
+		"""Return any maps subfolder with a valid timestamp suffix created within
+		the last 5 minutes, or create a new one named {map_stem}_{timestamp}.
+		Searches ALL subfolders (not just those matching map_stem) so that nodes
+		using different map yaml paths share the same session folder."""
+		maps_dir = '/home/erik/rins/maps'
+		now = datetime.now()
+		cutoff = 5 * 60  # 5 minutes in seconds
+		TS_LEN = len('2026-03-30_19.55.42')  # 19 chars
+
+		best_folder = None
+		best_dt = None
+		for entry in os.scandir(maps_dir):
+			if not entry.is_dir():
+				continue
+			name = entry.name
+			# The timestamp is always the last 19 characters: YYYY-MM-DD_HH.MM.SS
+			if len(name) < TS_LEN + 1 or name[-(TS_LEN + 1)] != '_':
+				continue
+			ts_str = name[-TS_LEN:]
+			try:
+				folder_dt = datetime.strptime(ts_str, '%Y-%m-%d_%H.%M.%S')
+			except ValueError:
+				continue
+			age = (now - folder_dt).total_seconds()
+			if 0 <= age <= cutoff:
+				if best_dt is None or folder_dt > best_dt:
+					best_dt = folder_dt
+					best_folder = entry.path
+
+		if best_folder is not None:
+			self.get_logger().info(f"Reusing existing map subfolder: {best_folder}")
+			return best_folder
+
+		ts = now.strftime('%Y-%m-%d_%H.%M.%S')
+		new_folder = os.path.join(maps_dir, f'{map_stem}_{ts}')
+		self.get_logger().info(f"Creating new map subfolder: {new_folder}")
+		return new_folder
+
 	def rgb_callback(self, data):
 
 		self.faces = []
@@ -112,7 +150,7 @@ class detect_faces(Node):
 		try:
 			cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
 
-			self.get_logger().info(f"Running inference on image...")
+			self.get_logger().debug(f"Running inference on image...")
 
 			# run inference
 			res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
@@ -124,7 +162,7 @@ class detect_faces(Node):
 					continue
 
 				for bbox in bboxes:
-					self.get_logger().info(f"Person has been detected!")
+					self.get_logger().debug(f"Person has been detected!")
 
 					x1 = int(bbox[0])
 					y1 = int(bbox[1])
@@ -382,7 +420,9 @@ class detect_faces(Node):
 				if is_new and dist_to_face < 3.0:
 					self.face_position_in_map_coordinates.append((map_x, map_y, map_z))
 					self.face_best_alignment_score.append(combined_score)
-					self.get_logger().info(f"NEW face at ({map_x:.2f}, {map_y:.2f}, {map_z:.2f}), score: {combined_score:.3f}")
+					self.get_logger().info(
+						f"\n\n\n=== NEW FACE DETECTED at ({map_x:.2f}, {map_y:.2f}, {map_z:.2f}) ==="
+						f"\nscore: {combined_score:.3f}\n")
 				elif not is_new and matched_idx >= 0:
 					while len(self.face_best_alignment_score) <= matched_idx:
 						self.face_best_alignment_score.append(0.0)
@@ -467,11 +507,9 @@ class detect_faces(Node):
 
 	def log_face_positions(self):
 		if self.face_position_in_map_coordinates:
-			self.get_logger().info(f"Detected {len(self.face_position_in_map_coordinates)} unique people in map coordinates:")
+			self.get_logger().debug(f"Detected {len(self.face_position_in_map_coordinates)} unique people in map coordinates:")
 			for i, (x, y, z) in enumerate(self.face_position_in_map_coordinates):
-				self.get_logger().info(f"  Person {i+1}: ({x:.2f}, {y:.2f}, {z:.2f})")
-		else:
-			self.get_logger().info("No faces detected yet")
+				self.get_logger().debug(f"  Person {i+1}: ({x:.2f}, {y:.2f}, {z:.2f})")
 
 def main():
 	print('Face detection node starting.')

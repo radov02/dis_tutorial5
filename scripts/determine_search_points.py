@@ -24,18 +24,14 @@ Each saved entry has the fields: x, y, yaw (0.0), label ("Point N").
 import json
 import math
 import os
-import sys
-
 import cv2
 import numpy as np
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy, QoSHistoryPolicy,
     QoSProfile, QoSReliabilityPolicy,
 )
-
 from nav_msgs.msg import OccupancyGrid
 
 qos_map = QoSProfile(

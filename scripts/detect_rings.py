@@ -108,8 +108,7 @@ class RingDetector(Node):
         map_yaml_path = self.get_parameter('map_yaml_path').get_parameter_value().string_value
         world_name    = self.get_parameter('world_name').get_parameter_value().string_value.strip()
         map_stem = os.path.splitext(os.path.basename(map_yaml_path))[0]
-        _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        _subfolder = os.path.join('/home/erik/rins/maps', _ts)
+        _subfolder = self._get_or_create_map_subfolder(map_stem)
         os.makedirs(_subfolder, exist_ok=True)
         _world_suffix = f'_{world_name}' if world_name else ''
         self.ring_detections_json_path = os.path.join(
@@ -164,6 +163,49 @@ class RingDetector(Node):
 
         # State for change-based printing (avoids per-frame spam)
         self._prev_depth_circle_states: list | None = None
+
+    # ------------------------------------------------------------------
+    # Folder helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_map_subfolder(self, map_stem: str) -> str:
+        """Return any maps subfolder with a valid timestamp suffix created within
+        the last 5 minutes, or create a new one named {map_stem}_{timestamp}.
+        Searches ALL subfolders (not just those matching map_stem) so that nodes
+        using different map yaml paths share the same session folder."""
+        maps_dir = '/home/erik/rins/maps'
+        now = datetime.now()
+        cutoff = 5 * 60  # 5 minutes in seconds
+        TS_LEN = len('2026-03-30_19.55.42')  # 19 chars
+
+        best_folder = None
+        best_dt = None
+        for entry in os.scandir(maps_dir):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            # The timestamp is always the last 19 characters: YYYY-MM-DD_HH.MM.SS
+            if len(name) < TS_LEN + 1 or name[-(TS_LEN + 1)] != '_':
+                continue
+            ts_str = name[-TS_LEN:]
+            try:
+                folder_dt = datetime.strptime(ts_str, '%Y-%m-%d_%H.%M.%S')
+            except ValueError:
+                continue
+            age = (now - folder_dt).total_seconds()
+            if 0 <= age <= cutoff:
+                if best_dt is None or folder_dt > best_dt:
+                    best_dt = folder_dt
+                    best_folder = entry.path
+
+        if best_folder is not None:
+            self.get_logger().info(f"Reusing existing map subfolder: {best_folder}")
+            return best_folder
+
+        ts = now.strftime('%Y-%m-%d_%H.%M.%S')
+        new_folder = os.path.join(maps_dir, f'{map_stem}_{ts}')
+        self.get_logger().info(f"Creating new map subfolder: {new_folder}")
+        return new_folder
 
     # ------------------------------------------------------------------
     # Sensor callbacks
@@ -414,6 +456,77 @@ class RingDetector(Node):
             return None
 
     # ------------------------------------------------------------------
+    # Ellipse fitting for ring skewness
+    # ------------------------------------------------------------------
+
+    def _fit_ellipse_eccentricity(self, cx: int, cy: int, radius: int) -> tuple:
+        """Fit an ellipse to the ring annulus contour near (cx, cy) in the
+        depth image and return (eccentricity, ellipse_angle_deg).
+
+        eccentricity ~ 0 means circular (head-on view),
+        eccentricity ~ 1 means very elongated (side-on view).
+
+        Returns (0.0, None) if fitting fails or not enough points.
+        """
+        if self.latest_depth_image is None:
+            return (0.0, None)
+
+        h, w = self.latest_depth_image.shape[:2]
+        r_outer = int(radius * 1.3)
+        r_inner = max(1, int(radius * 0.7))
+
+        # Build a mask for the annulus region
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(mask, (cx, cy), r_outer, 255, -1)
+        cv2.circle(mask, (cx, cy), r_inner, 0, -1)
+
+        # Clamp to image bounds
+        y0 = max(0, cy - r_outer - 2)
+        y1 = min(h, cy + r_outer + 3)
+        x0 = max(0, cx - r_outer - 2)
+        x1 = min(w, cx + r_outer + 3)
+
+        roi_mask = mask[y0:y1, x0:x1]
+
+        # Threshold the depth in the annulus to get ring-edge pixels
+        depth_roi = self.latest_depth_image[y0:y1, x0:x1].copy()
+        # Normalise depth to 8-bit for edge detection
+        valid = depth_roi[depth_roi > 0]
+        if len(valid) < 10:
+            return (0.0, None)
+        dmin, dmax = np.percentile(valid, [5, 95])
+        if dmax - dmin < 1e-6:
+            return (0.0, None)
+        norm = np.clip((depth_roi - dmin) / (dmax - dmin) * 255, 0, 255).astype(np.uint8)
+
+        edges = cv2.Canny(norm, 30, 100)
+        edges = cv2.bitwise_and(edges, roi_mask)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return (0.0, None)
+
+        # Merge all contour points
+        all_pts = np.vstack(contours)
+        if len(all_pts) < 5:
+            return (0.0, None)
+
+        try:
+            ellipse = cv2.fitEllipse(all_pts)
+        except cv2.error:
+            return (0.0, None)
+
+        (ecx, ecy), (ma, MA), angle = ellipse
+        if MA < 1e-6:
+            return (0.0, None)
+
+        # eccentricity = sqrt(1 - (minor/major)^2)
+        minor = min(ma, MA)
+        major = max(ma, MA)
+        ecc = math.sqrt(1.0 - (minor / major) ** 2)
+        return (ecc, angle)
+
+    # ------------------------------------------------------------------
     # Main image processing
     # ------------------------------------------------------------------
 
@@ -442,17 +555,17 @@ class RingDetector(Node):
         if not getattr(self, '_diag_logged', False):
             dshape = self.latest_depth_image.shape \
                 if self.latest_depth_image is not None else 'None'
-            print(f"[DIAG] RGB: {img_w}x{img_h}  Depth: {dshape}")
+            self.get_logger().info(f"[DIAG] RGB: {img_w}x{img_h}  Depth: {dshape}")
             self._diag_logged = True
 
         if self.latest_depth_image is None:
-            print("[WARN] No depth image received yet - skipping frame")
+            self.get_logger().debug("No depth image received yet - skipping frame")
             cv2.imshow("Detected rings", cv_image)
             cv2.waitKey(1)
             return
 
         if self.camera_info is None:
-            print("[WARN] No camera_info received yet - skipping frame")
+            self.get_logger().debug("No camera_info received yet - skipping frame")
             cv2.imshow("Detected rings", cv_image)
             cv2.waitKey(1)
             return
@@ -618,9 +731,11 @@ class RingDetector(Node):
                             continue
 
                         pair_indices.update([i, j])
+                        _ecc, _eang = self._fit_ellipse_eccentricity(dpx, dpy, outer_r_d)
                         ring_candidates.append({
                             "px": rgb_px, "py": rgb_py,
                             "outer_r": rgb_or, "inner_r": rgb_ir,
+                            "eccentricity": _ecc, "ellipse_angle": _eang,
                         })
                         break  # i is paired; move to next i
 
@@ -689,9 +804,11 @@ class RingDetector(Node):
                             if not (img_h * 0.08 < rgb_py < img_h * 0.92):
                                 continue
                             pair_indices.add(i)
+                            _ecc_s, _eang_s = self._fit_ellipse_eccentricity(dpx_s, dpy_s, outer_r_d)
                             ring_candidates.append({
                                 "px": rgb_px, "py": rgb_py,
                                 "outer_r": rgb_or, "inner_r": rgb_ir,
+                                "eccentricity": _ecc_s, "ellipse_angle": _eang_s,
                             })
                             reject_reason[i] = f"paired-via-sweep (partner_r={target_r})"
                             found_pair = True
@@ -726,14 +843,13 @@ class RingDetector(Node):
             # Log on change only
             if depth_circle_states != self._prev_depth_circle_states:
                 if not depth_circle_states:
-                    print("[INFO] Depth HoughCircles: no circles detected")
+                    self.get_logger().debug("Depth HoughCircles: no circles detected")
                 else:
-                    print(f"[INFO] Depth HoughCircles: {len(depth_circle_states)} circle(s), "
-                          f"{len(ring_candidates)} concentric pair(s)")
-                    if len(ring_candidates) > 0:
-                        print('\n\n\n\n\n\n\n\n')
+                    self.get_logger().debug(
+                        f"Depth HoughCircles: {len(depth_circle_states)} circle(s), "
+                        f"{len(ring_candidates)} concentric pair(s)")
                     for dpx, dpy, dr, label in depth_circle_states:
-                        print(f"  depth circle at ({dpx},{dpy}) r={dr}  [{label}]")
+                        self.get_logger().debug(f"  depth circle at ({dpx},{dpy}) r={dr}  [{label}]")
                 self._prev_depth_circle_states = depth_circle_states
 
         # 3-7. Validate each candidate and build map position ---------------
@@ -748,32 +864,32 @@ class RingDetector(Node):
             # HoughCircles.  Erosion only affects circle pixel detection, not the
             # depth values sampled here.
             if not self._is_3d_ring(px, py, outer_r, inner_r, img_h, img_w):
-                print(f"  Ring at ({px},{py}): depth hole not found - 2-D drawing, skipped")
+                self.get_logger().debug(f"  Ring at ({px},{py}): depth hole not found - 2-D drawing, skipped")
                 continue
 
             # --- depth at ring band ---
             depth_m = self._get_ring_band_depth(px, py, outer_r, inner_r, img_h, img_w)
             if depth_m is None:
-                print(f"  Ring at ({px},{py}): no valid depth on ring band - skipped")
+                self.get_logger().debug(f"  Ring at ({px},{py}): no valid depth on ring band - skipped")
                 continue
 
             # --- physical size filter ---
             diameter_m = self._ring_physical_diameter_m(float(outer_r), depth_m)
             if diameter_m is None or \
                not (RING_MIN_DIAMETER_M <= diameter_m <= RING_MAX_DIAMETER_M):
-                print(f"  Ring at ({px},{py}): diameter {diameter_m} m out of range - skipped")
+                self.get_logger().debug(f"  Ring at ({px},{py}): diameter {diameter_m} m out of range - skipped")
                 continue
 
             # --- back-project to /map ---
             map_pos = self._ring_map_position(px, py, depth_m, data.header)
             if map_pos is None:
-                print(f"  Ring at ({px},{py}): TF to map failed - skipped")
+                self.get_logger().debug(f"  Ring at ({px},{py}): TF to map failed - skipped")
                 continue
             wx, wy, wz = map_pos
 
             # --- elevation filter ---
             if not (RING_MIN_Z_MAP_M <= wz <= RING_MAX_Z_MAP_M):
-                print(f"  Ring at ({px},{py}): map-Z {wz:.2f} m out of "
+                self.get_logger().debug(f"  Ring at ({px},{py}): map-Z {wz:.2f} m out of "
                       f"[{RING_MIN_Z_MAP_M}, {RING_MAX_Z_MAP_M}] - skipped")
                 continue
 
@@ -785,6 +901,7 @@ class RingDetector(Node):
             # compute wall tangent, then nudge the marker 0.3 m toward the robot.
             RING_OFFSET_M = 0.3
             offset_applied = False
+            wall_normal_angle = None
             try:
                 robot_tf = self.tf_buffer.lookup_transform(
                     "map", "base_link", rclpy.time.Time(),
@@ -819,6 +936,7 @@ class RingDetector(Node):
                             wx += nx * RING_OFFSET_M
                             wy += ny * RING_OFFSET_M
                             offset_applied = True
+                            wall_normal_angle = math.degrees(math.atan2(ny, nx))
 
                 # Fallback: offset straight toward robot
                 if not offset_applied:
@@ -828,15 +946,18 @@ class RingDetector(Node):
                     if to_r_dist > 0.01:
                         wx += (to_r_dx / to_r_dist) * RING_OFFSET_M
                         wy += (to_r_dy / to_r_dist) * RING_OFFSET_M
+                        wall_normal_angle = math.degrees(math.atan2(to_r_dy, to_r_dx))
             except Exception as e:
                 self.get_logger().debug(f"Ring offset TF failed: {e}")
 
-            print(f"  Valid ring at ({px},{py}): depth={depth_m:.2f} m  "
-                  f"diam={diameter_m*100:.1f} cm  "
-                  f"map=({wx:.2f}, {wy:.2f}, {wz:.2f})  colour={color_name}"
-                  f"  offset={'wall' if offset_applied else 'robot-fallback'}")
+            eccentricity = c.get("eccentricity", 0.0)
+            self.get_logger().debug(
+                f"  Valid ring at ({px},{py}): depth={depth_m:.2f} m  "
+                f"diam={diameter_m*100:.1f} cm  "
+                f"map=({wx:.2f}, {wy:.2f}, {wz:.2f})  colour={color_name}"
+                f"  ecc={eccentricity:.2f}  offset={'wall' if offset_applied else 'robot-fallback'}")
 
-            self._process_ring_detection(wx, wy, wz, color_name)
+            self._process_ring_detection(wx, wy, wz, color_name, eccentricity, wall_normal_angle)
 
             # Draw accepted ring on RGB image
             cv2.circle(cv_image, (px, py), outer_r, (0, 255, 0), 2)
@@ -864,28 +985,35 @@ class RingDetector(Node):
             return "unknown"
 
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        h_val, s_val, v_val = cv2.mean(hsv, mask=ring_mask)[:3]
+        ring_pixels = hsv[ring_mask > 0]
+        if ring_pixels.size == 0:
+            return "unknown"
+        h_val = float(np.median(ring_pixels[:, 0]))
+        s_val = float(np.median(ring_pixels[:, 1]))
+        v_val = float(np.median(ring_pixels[:, 2]))
 
         if s_val < 40:
             return "black" if v_val < 80 else "white"
-        if h_val < 10 or h_val > 170:  return "red"
-        if 10  <= h_val < 25:           return "orange"
-        if 25  <= h_val < 35:           return "yellow"
-        if 35  <= h_val < 85:           return "green"
-        if 85  <= h_val < 130:          return "blue"
-        if 130 <= h_val < 170:          return "purple"
+        if h_val < 8 or h_val > 170:   return "red"
+        if 8   <= h_val < 22:           return "orange"
+        if 22  <= h_val < 35:           return "yellow"
+        if 35  <= h_val < 78:           return "green"
+        if 78  <= h_val < 100:          return "cyan"
+        if 100 <= h_val < 135:          return "blue"
+        if 135 <= h_val < 170:          return "purple"
         return "unknown"
 
     # ------------------------------------------------------------------
     # Detection accumulation & publishing
     # ------------------------------------------------------------------
 
-    def _process_ring_detection(self, x, y, z, color_name):
+    def _process_ring_detection(self, x, y, z, color_name, eccentricity=0.0, wall_normal_angle=None):
         """Merge this /map-frame sighting into confirmed rings via running average.
 
         Every valid sighting is immediately confirmed (RING_MIN_CONFIRMATIONS=1).
         Subsequent sightings within RING_DEDUP_DISTANCE_M update the running
         average and republish, so the marker always reflects the latest position.
+        Colour is determined by majority voting across all sightings.
         """
         if math.isnan(x) or math.isnan(y) or math.isnan(z):
             return
@@ -897,14 +1025,29 @@ class RingDetector(Node):
                 ring["x"] += (x - ring["x"]) / n
                 ring["y"] += (y - ring["y"]) / n
                 ring["z"] += (z - ring["z"]) / n
+                # Update colour via majority voting
+                votes = ring.get("color_votes", {ring["color"]: ring["count"] - 1})
+                votes[color_name] = votes.get(color_name, 0) + 1
+                ring["color_votes"] = votes
+                ring["color"] = max(votes, key=votes.get)
+                # Update eccentricity and wall normal (keep latest)
+                ring["eccentricity"] = eccentricity
+                if wall_normal_angle is not None:
+                    ring["wall_normal_angle"] = wall_normal_angle
                 self.get_logger().debug(
                     f"UPDATED ring {ring['color']} pos=({ring['x']:.2f}, {ring['y']:.2f}, {ring['z']:.2f}) n={n}")
                 self._publish_ring_markers()
                 return
         # Brand-new ring
-        self.ring_detections.append({"x": x, "y": y, "z": z, "color": color_name, "count": 1})
+        self.ring_detections.append({
+            "x": x, "y": y, "z": z, "color": color_name, "count": 1,
+            "color_votes": {color_name: 1},
+            "eccentricity": eccentricity,
+            "wall_normal_angle": wall_normal_angle,
+        })
         self.get_logger().info(
-            f"NEW ring: colour={color_name} pos=({x:.2f}, {y:.2f}, {z:.2f}) total={len(self.ring_detections)}")
+            f"\n\n\n=== NEW RING DETECTED: {color_name} at ({x:.2f}, {y:.2f}, {z:.2f}) ==="
+            f"\nTotal rings: {len(self.ring_detections)}\n")
         self._publish_ring_markers()
 
     def save_detections_to_json(self):
@@ -970,7 +1113,10 @@ class RingDetector(Node):
             m.pose.position.y = y
             m.pose.position.z = z
 
-            m.text = cname       # consumed by halfautonomous_search
+            # Encode colour, eccentricity, and wall-normal angle for downstream nodes
+            _ecc = ring.get("eccentricity", 0.0)
+            _wna = ring.get("wall_normal_angle")
+            m.text = f"{cname}|{_ecc:.2f}|{_wna:.1f}" if _wna is not None else f"{cname}|{_ecc:.2f}|"
 
             ma.markers.append(m)
         self.ring_marker_pub.publish(ma)

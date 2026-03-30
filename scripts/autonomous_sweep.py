@@ -53,13 +53,14 @@ amcl_pose_qos = QoSProfile(
           depth=1)
 
 PERCEPTION_RADIUS_M = 0.3          # robot perception radius (m)
-GLOBAL_COST_THRESHOLD = 20         # max global costmap cost for traversable cells
+GLOBAL_COST_THRESHOLD = 60         # max global costmap cost for traversable cells
 LOCAL_OBSTACLE_THRESHOLD = 90      # local costmap cost indicating an obstacle (high to avoid robot footprint inflation FP)
 VIEWPOINT_GRID_STEP_M = 0.4       # grid spacing between candidate viewpoints (m)
 RING_DEDUP_DISTANCE_M = 0.5       # min distance to merge ring detections (m)
 OBSTACLE_LOOKAHEAD_M = 0.6        # how far ahead (m) to scan for new obstacles
 
 # Geofence polygon (map frame, x/y in metres, CW or CCW). Robot won't navigate outside.
+GEOFENCE_ENABLED: bool = False
 ALLOWED_AREA_POLYGON: list[tuple[float, float]] = [
     (-4.52, -8.10),
     (-4.48, 0.75),
@@ -70,9 +71,9 @@ ALLOWED_AREA_POLYGON: list[tuple[float, float]] = [
 
 class RobotCommander(Node):
 
-    def __init__(self, node_name='robot_commander', namespace=''):
+    def __init__(self, node_name='robot_commander', namespace='', geofence_enabled=GEOFENCE_ENABLED):
         super().__init__(node_name=node_name, namespace=namespace)
-        
+        self._geofence_enabled = geofence_enabled
         self.pose_frame_id = 'map'
         self.goal_handle = None
         self.result_future = None
@@ -98,11 +99,10 @@ class RobotCommander(Node):
         self.timer = self.create_timer(1.0, self.timer_callback)
 
         self._init_ring_detection()
-        # Cooperative queues for face/ring reactive behaviors (consumed by main loop)
         self._pending_face_approach: list[tuple[float, float]] = []
-        self._pending_ring_inspect: list[tuple[float, float]]  = []
-        self._inspected_rings: set[tuple[float, float]] = set()   # already inspected
-        self._approached_faces: set[tuple[float, float]] = set()  # already approached
+        self._pending_ring_inspect: list[tuple[float, float]] = []
+        self._inspected_rings: set[tuple[float, float]] = set()
+        self._approached_faces: set[tuple[float, float]] = set()
         self.get_logger().info("Robot commander initialized.")
 
     def destroyNode(self):
@@ -318,8 +318,6 @@ class RobotCommander(Node):
         return
 
 
-    # -------------------- Autonomous search helpers ------------------------------------
-
     def _init_autonomous_search(self):
         """Set up state, subscribers, and timers needed for autonomous search."""
         self._global_costmap: OccupancyGrid | None = None
@@ -332,8 +330,6 @@ class RobotCommander(Node):
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self._globalCostmapCallback, qos_profile_sensor_data)
         self.create_subscription(OccupancyGrid, '/local_costmap/costmap', self._localCostmapCallback, qos_profile_sensor_data)
         self.create_subscription(Range, 'ir_intensity_side_left', self._cliffCallback, qos_profile_sensor_data)
-
-        # Continuously monitor for new obstacles ahead (2 Hz)
         self._obstacle_ahead_timer = self.create_timer(0.5, self._check_obstacle_ahead_callback)
 
     def _globalCostmapCallback(self, msg: OccupancyGrid):
@@ -415,14 +411,25 @@ class RobotCommander(Node):
         return wx, wy
 
     def _is_in_allowed_area(self, wx: float, wy: float) -> bool:
-        # Geofencing removed — allow all positions
-        return True
+        if not self._geofence_enabled:
+            return True
+        poly = ALLOWED_AREA_POLYGON
+        n = len(poly)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > wy) != (yj > wy)) and (wx < (xj - xi) * (wy - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
 
     def _is_within_costmap_bounds(self, wx: float, wy: float) -> bool:
         """Return True if (wx, wy) maps to a valid cell inside the global costmap.
         Prevents 'worldToMap failed' errors when Nav2 receives out-of-bounds goals."""
         if not hasattr(self, '_global_costmap') or self._global_costmap is None:
-            return True  # no costmap yet; let Nav2 decide
+            return True
         row, col = self._world_to_cell(self._global_costmap, wx, wy)
         h = self._global_costmap.info.height
         w = self._global_costmap.info.width
@@ -483,13 +490,10 @@ class RobotCommander(Node):
         if self.result_future is None or self.isTaskComplete():
             return  # not currently navigating
 
-        # Grace period: skip obstacle checking for the first 2 s of each goal
-        # so the robot has time to move out of its own footprint inflation zone.
         nav_start = getattr(self, '_nav_goal_start_time', None)
         if nav_start is None or (time.time() - nav_start) < 2.0:
             return
 
-        # Derive robot heading from amcl orientation (yaw from quaternion)
         q = self.current_pose.pose.orientation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
@@ -503,8 +507,6 @@ class RobotCommander(Node):
         gh, gw = global_grid.shape
         res = self._local_costmap.info.resolution
 
-        # Sample cells along the heading vector up to OBSTACLE_LOOKAHEAD_M.
-        # Start at 0.35 m ahead to skip the robot's own footprint inflation zone.
         LOOKAHEAD_START_M = 0.35
         steps = max(1, int(OBSTACLE_LOOKAHEAD_M / res))
         start_step = max(1, int(LOOKAHEAD_START_M / res))
@@ -514,12 +516,10 @@ class RobotCommander(Node):
         sin_yaw = math.sin(yaw)
 
         for step in range(start_step, steps + 1):
-            # Centre of the scan strip at this distance
             wx = rx + cos_yaw * step * res
             wy = ry + sin_yaw * step * res
             cr, cc = self._world_to_cell(self._local_costmap, wx, wy)
 
-            # Check a narrow band perpendicular to the heading
             for w in range(-width_cells, width_cells + 1):
                 lr = cr + int(round(-sin_yaw * w))
                 lc = cc + int(round( cos_yaw * w))
@@ -534,20 +534,16 @@ class RobotCommander(Node):
                     if int(global_grid[grow, gcol]) < GLOBAL_COST_THRESHOLD:
                         self._obstacle_debounce += 1
                         if self._obstacle_debounce < 3:
-                            # Require 3 consecutive detections (~1.5 s) before acting
                             return
                         self.warn(
                             f"New obstacle ahead at ({wx:.2f}, {wy:.2f}) – "
                             "cancelling current goal to replan.")
                         self._obstacle_blocked = True
                         self._obstacle_debounce = 0
-                        # Fire-and-forget: do NOT call cancelTask() here because
-                        # that blocks via _wait_for_future, starving the executor
-                        # thread and freezing all other timers (breadcrumbs etc.).
+                        # Do NOT call cancelTask() here – it blocks the executor thread.
                         if self.goal_handle is not None:
                             self.goal_handle.cancel_goal_async()
                         return
-        # No obstacle detected this tick – reset debounce counter.
         self._obstacle_debounce = 0
 
     def _order_viewpoints_by_proximity(self, viewpoints: list[tuple[float, float]], start_x: float, start_y: float) -> list[tuple[float, float]]:
@@ -579,10 +575,9 @@ class RobotCommander(Node):
         for row in range(r_cells, h - r_cells, step):
             for col in range(r_cells, w - r_cells, step):
                 cost = int(grid[row, col])
-                if cost < 0 or cost >= GLOBAL_COST_THRESHOLD:  # unknown or too costly
+                if cost < 0 or cost >= GLOBAL_COST_THRESHOLD:
                     continue
 
-                # Vectorised check: at least one free cell inside the perception circle
                 r0, r1 = max(0, row - r_cells), min(h, row + r_cells + 1)
                 c0, c1 = max(0, col - r_cells), min(w, col + r_cells + 1)
                 patch = grid[r0:r1, c0:c1].astype(int)
@@ -603,13 +598,10 @@ class RobotCommander(Node):
         return candidates
 
 
-    # -------------------- Ring detection helpers -----------------------------------
-
     def _init_ring_detection(self):
         """Subscribe to /detected_rings published by the detect_rings node."""
-        self.ring_detections = []       # list of (x, y, z, color_name) in map frame
+        self.ring_detections = []
 
-        # Subscribe to ring detections from the detect_rings node
         self.ring_detection_sub = self.create_subscription(
             MarkerArray, "/detected_rings", self._detected_rings_callback,
             QoSProfile(
@@ -618,7 +610,6 @@ class RobotCommander(Node):
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=1))
 
-        # Also subscribe to face detections (other node should publish MarkerArray to /detected_faces)
         self.face_detection_sub = self.create_subscription(
             MarkerArray, "/detected_faces", self._detected_faces_callback,
             QoSProfile(
@@ -641,7 +632,6 @@ class RobotCommander(Node):
                 continue
             fresh.append((x, y, z, color_name))
 
-        # Determine which rings are new (rounded coords to avoid tiny jitter)
         prev_set = set((round(r[0], 2), round(r[1], 2), r[3]) for r in self.ring_detections)
         fresh_set = set((round(r[0], 2), round(r[1], 2), r[3]) for r in fresh)
         new_rounded = fresh_set - prev_set
@@ -650,7 +640,6 @@ class RobotCommander(Node):
             self.ring_detections = fresh
             self.info(f"Ring list updated: {len(self.ring_detections)} ring(s) known.")
 
-        # Queue newly-seen rings for left/right inspection by the main loop
         for nr in new_rounded:
             rx, ry, rcolor = nr
             match = next((r for r in fresh if round(r[0], 2) == rx and round(r[1], 2) == ry and r[3] == rcolor), None)
@@ -664,8 +653,6 @@ class RobotCommander(Node):
                 self._pending_ring_inspect.append((match[0], match[1]))
                 self.info(f'Queued ring inspection at ({match[0]:.2f}, {match[1]:.2f})')
 
-    # ---- accumulation & persistence ----
-
     def _add_ring_detection(self, x, y, z, color_name):
         """Store a ring detection, merging duplicates within RING_DEDUP_DISTANCE_M."""
         if math.isnan(x) or math.isnan(y):
@@ -678,8 +665,6 @@ class RobotCommander(Node):
                 return  # duplicate
         self.ring_detections.append((x, y, z, color_name))
         self.info(f"New ring detected! colour={color_name}  pos=({x:.2f}, {y:.2f}, {z:.2f})  total={len(self.ring_detections)}")
-
-    # -------------------- Face + ring reactive behaviors -----------------------
 
     def _detected_faces_callback(self, msg: MarkerArray):
         """Queue detected faces for approach by the main navigation loop.
@@ -702,8 +687,6 @@ class RobotCommander(Node):
             self._pending_face_approach.append((x, y))
             self.info(f'Queued face approach at ({x:.2f}, {y:.2f})')
 
-    # --- these are called from the main loop (NOT from background threads) ---
-
     def _approach_face(self, x: float, y: float, stop_distance: float = 0.8):
         """Navigate toward a face for better localization.  Called inline from the
         main navigation loop so there are no shared-state race conditions."""
@@ -711,15 +694,13 @@ class RobotCommander(Node):
         if not hasattr(self, 'current_pose'):
             self.warn('No current_pose; cannot approach face.')
             return
-        rx = self.current_pose.pose.position.x
-        ry = self.current_pose.pose.position.y
+        rx, ry = self.current_pose.pose.position.x, self.current_pose.pose.position.y
         dx, dy = x - rx, y - ry
         dist = math.hypot(dx, dy)
         if dist <= stop_distance:
             self.info('Already close to detected face.')
             return
 
-        # Aim at a point stop_distance away from the face, along the face->robot vector
         aim_x = x - (dx / dist) * stop_distance
         aim_y = y - (dy / dist) * stop_distance
 
@@ -728,7 +709,6 @@ class RobotCommander(Node):
         goal.header.stamp = self.get_clock().now().to_msg()
         goal.pose.position.x = aim_x
         goal.pose.position.y = aim_y
-        # Face toward the detected face
         goal.pose.orientation = self.YawToQuaternion(math.atan2(y - aim_y, x - aim_x))
 
         self.info(f'Approaching face at ({x:.2f},{y:.2f}) -> ({aim_x:.2f},{aim_y:.2f})')
@@ -743,7 +723,6 @@ class RobotCommander(Node):
                 self.warn('Face approach timed out; cancelling.')
                 self.cancelTask()
                 break
-        # Brief pause to let sensors observe the face up close
         time.sleep(2.0)
 
     def _inspect_ring(self, x: float, y: float, radius: float = 0.8, angle_offset: float = 0.6):
@@ -780,7 +759,6 @@ class RobotCommander(Node):
                     self.warn('Ring inspect timed out; cancelling.')
                     self.cancelTask()
                     break
-            # Short pause to let sensors observe from this angle
             time.sleep(2.0)
 
     def _process_pending_detections(self):
@@ -911,22 +889,26 @@ class RobotCommander(Node):
 
             self.info(f"  Covered. Rings so far: {len(self.ring_detections)}")
 
-        # Drain any remaining detections after all viewpoints are exhausted
         self._process_pending_detections()
         self.info(f"Autonomous search complete. Detected {len(self.ring_detections)} ring(s).")
         self.save_ring_detections('/home/erik/rins/src/dis_tutorial5/ring_detections.json')
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    rc = RobotCommander()
+    import argparse, sys
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--turnoff', action='store_true', help='Disable geofencing')
+    parsed, remaining = parser.parse_known_args(sys.argv[1:] if args is None else args)
 
-    # Spin in a background thread so futures can be awaited from the main thread
+    rclpy.init(args=remaining)
+    rc = RobotCommander(geofence_enabled=not parsed.turnoff)
+
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(rc)
     threading.Thread(target=executor.spin, daemon=True).start()
 
     rc.waitUntilNav2Active()
+    rc.info("Geofencing: " + ("DISABLED" if parsed.turnoff else "ENABLED"))
 
     while rc.is_docked is None:
         time.sleep(0.5)

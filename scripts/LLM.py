@@ -12,7 +12,7 @@ from robot_interfaces.srv import LLMQuery
 class LLMNode(Node):
     def __init__(self):
         super().__init__('llm_node')
-        self.create_service(LLMQuery, 'llm_inference', self.handle_query)
+        self.create_service(LLMQuery, 'llm_inference', self._handle_query)
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
         self.declare_parameter('model_name', 'llama3.2:3b')
         self.declare_parameter('request_timeout', 15.0)
@@ -26,12 +26,9 @@ class LLMNode(Node):
         self.max_tokens = int(self.get_parameter('max_tokens').value)
         self.temperature = float(self.get_parameter('temperature').value)
         self.keep_alive = self.get_parameter('keep_alive').value
-        self.get_logger().info(
-            f'LLMNode initialized with model "{self.model_name}", timeout={self.request_timeout:.1f}s, '
-            f'max_tokens={self.max_tokens}, keep_alive={self.keep_alive}'
-        )
+        self.get_logger().info(f'LLMNode initialized with model "{self.model_name}", timeout={self.request_timeout:.1f}s, max_tokens={self.max_tokens}, keep_alive={self.keep_alive}')
 
-    def handle_query(self, request, response):
+    def _handle_query(self, request, response):
         prompt = request.prompt.strip()
         self.get_logger().info(f'Received LLM query: {prompt}')
 
