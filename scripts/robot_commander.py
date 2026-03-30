@@ -76,15 +76,6 @@ LOCAL_OBSTACLE_THRESHOLD = 65      # local costmap cost above this = unexpected 
 VIEWPOINT_GRID_STEP_M = 0.4       # spacing between sampled viewpoints (metres)
 RING_DEDUP_DISTANCE_M = 0.5       # merge ring detections closer than this (metres)
 
-# Geofence: closed polygon defining the allowed operating area in map frame.
-# The robot will refuse to navigate to any goal outside this polygon.
-# Vertices are (x, y) in metres, listed in order (CW or CCW). Adjust to your map.
-ALLOWED_AREA_POLYGON: list[tuple[float, float]] = [
-    (-4.52, -8.10),
-    (-4.48, 0.75),
-    (3.07, 0.75),
-    (3.02, -8.01),
-]
 
 class RobotCommander(Node):
 
@@ -412,11 +403,29 @@ class RobotCommander(Node):
             face_position_in_map_coordinates = [tuple(d) for d in data]
             self.get_logger().info(f"Loaded {len(face_position_in_map_coordinates)} previous detections from {detections_json_path}")
 
-            for face_tuple in face_position_in_map_coordinates:
-                # skip invalid detections
-                if any(math.isnan(v) for v in face_tuple[:2]):
-                    self.get_logger().warn(f"Skipping detection with invalid coordinates: {face_tuple}")
+            # Filter out invalid detections up front
+            valid = [ft for ft in face_position_in_map_coordinates if not any(math.isnan(v) for v in ft[:2])]
+            remaining = list(valid)
+            visited: set[tuple[float, float]] = set()
+            total = len(remaining)
+
+            while remaining:
+                cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
+                cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+
+                # Greedy closest-first selection
+                remaining.sort(key=lambda ft: (ft[0] - cur_x) ** 2 + (ft[1] - cur_y) ** 2)
+                face_tuple = remaining.pop(0)
+                face_key = (round(face_tuple[0], 3), round(face_tuple[1], 3))
+                if face_key in visited:
                     continue
+                visited.add(face_key)
+
+                dist = math.hypot(face_tuple[0] - cur_x, face_tuple[1] - cur_y)
+                idx = total - len(remaining)
+                self.get_logger().info(
+                    f"[{idx}/{total}] Chosen CLOSEST person at ({face_tuple[0]:.2f}, {face_tuple[1]:.2f}), "
+                    f"dist={dist:.2f} m from robot ({cur_x:.2f}, {cur_y:.2f})")
 
                 # prefetch so LLM has the full travel time to respond:
                 prefetch_result = [None]
@@ -426,8 +435,6 @@ class RobotCommander(Node):
                 prefetch_thread.start()
 
                 # Compute yaw so the robot faces toward the person
-                cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
-                cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
                 yaw = math.atan2(face_tuple[1] - cur_y, face_tuple[0] - cur_x)
 
                 # set goal to reach and navigate there:
@@ -590,25 +597,8 @@ class RobotCommander(Node):
         return wx, wy
 
     def _is_in_allowed_area(self, wx: float, wy: float) -> bool:
-        """Ray-casting point-in-polygon test against ALLOWED_AREA_POLYGON.
-
-        Returns True if (wx, wy) is inside the geofence polygon, False otherwise.
-        Works for any simple (non-self-intersecting) polygon, CW or CCW.
-        """
-        poly = ALLOWED_AREA_POLYGON
-        n = len(poly)
-        if n < 3:
-            return True  # degenerate polygon -> no restriction
-        inside = False
-        px, py = wx, wy
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
-                inside = not inside
-            j = i
-        return inside
+        """Geofencing disabled – always returns True."""
+        return True
 
     def _is_cliff_safe(self) -> bool:
         if self._cliff_detected:
@@ -789,7 +779,7 @@ class RobotCommander(Node):
         self.info(f"Saved {len(self.ring_detections)} ring detections to {filepath}")
 
     def walk_to_rings(self, detections_json_path=None):
-        """Navigate to every detected (or previously saved) ring."""
+        """Navigate to every detected (or previously saved) ring in greedy closest-first order."""
         rings = list(self.ring_detections)
 
         if detections_json_path:
@@ -807,24 +797,38 @@ class RobotCommander(Node):
             self.info("No ring detections to visit.")
             return
 
-        RING_STANDOFF_M = 0.5  # stop this far from the ring and face it
+        RING_STANDOFF_M = 0.15  # stop this far from the ring and face it
 
-        self.info(f"Navigating to {len(rings)} detected ring(s)...")
-        for i, (x, y, z, color) in enumerate(rings):
-            if math.isnan(x) or math.isnan(y):
-                self.warn(f"Skipping ring {i+1} with invalid coordinates.")
-                continue
+        # Filter out invalid coordinates
+        remaining = [(x, y, z, c) for x, y, z, c in rings if not (math.isnan(x) or math.isnan(y))]
+        visited: set[tuple[float, float]] = set()
+        total = len(remaining)
 
-            self.info(f"[{i+1}/{len(rings)}] Going to {color} ring at ({x:.2f}, {y:.2f})")
+        self.info(f"Navigating to {total} detected ring(s) (closest-first)...")
 
-            # Compute standoff point: offset from ring toward current robot position
+        while remaining:
             cur_x = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
             cur_y = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
+
+            # Greedy closest-first selection
+            remaining.sort(key=lambda r: (r[0] - cur_x) ** 2 + (r[1] - cur_y) ** 2)
+            x, y, z, color = remaining.pop(0)
+            ring_key = (round(x, 3), round(y, 3))
+            if ring_key in visited:
+                continue
+            visited.add(ring_key)
+
+            dist_to_ring = math.hypot(x - cur_x, y - cur_y)
+            idx = total - len(remaining)
+            self.info(
+                f"[{idx}/{total}] Chosen CLOSEST ring: {color} at ({x:.2f}, {y:.2f}), "
+                f"dist={dist_to_ring:.2f} m from robot ({cur_x:.2f}, {cur_y:.2f})")
+
+            # Compute standoff point: offset from ring toward current robot position
             dx = x - cur_x
             dy = y - cur_y
             dist = math.sqrt(dx**2 + dy**2)
             if dist > RING_STANDOFF_M:
-                # Place goal RING_STANDOFF_M before the ring, facing it
                 goal_x = x - (dx / dist) * RING_STANDOFF_M
                 goal_y = y - (dy / dist) * RING_STANDOFF_M
             else:
@@ -1014,21 +1018,31 @@ class RobotCommander(Node):
             self.warn("No targets loaded from detections folder.")
             return
 
-        self.info(f"Navigating to {len(targets)} target(s) (closest-first)...")
+        self.info(f"Navigating to {len(targets)} target(s) (greedy closest-first)...")
         remaining = list(targets)
-        PERSON_STANDOFF_M = 0.8
-        RING_STANDOFF_M = 0.5
+        visited: set[tuple[float, float]] = set()
+        PERSON_STANDOFF_M = 0.08
+        RING_STANDOFF_M = 0.08
+        # Fallback standoff distances tried in order when Nav2 aborts
+        STANDOFF_FALLBACKS = [0.8, 1.2]
 
         while remaining:
             # Current robot pose
             cx = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else 0.0
             cy = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else 0.0
 
-            # Pick closest target
+            # Pick closest target (greedy)
             remaining.sort(key=lambda t: (t['x'] - cx) ** 2 + (t['y'] - cy) ** 2)
             target = remaining.pop(0)
             tx, ty = target['x'], target['y']
             ttype = target['type']
+
+            # Deduplicate – skip if we already visited this location
+            target_key = (round(tx, 3), round(ty, 3))
+            if target_key in visited:
+                continue
+            visited.add(target_key)
+
             idx = len(targets) - len(remaining)
 
             # Compute standoff goal
@@ -1044,7 +1058,9 @@ class RobotCommander(Node):
             yaw = math.atan2(ty - goal_y, tx - goal_x)
 
             label = ttype if ttype == 'person' else f"{target.get('color', '')} ring"
-            self.info(f"[{idx}/{len(targets)}] -> {label} at ({tx:.2f}, {ty:.2f})")
+            self.info(
+                f"[{idx}/{len(targets)}] Chosen CLOSEST target: {label} at ({tx:.2f}, {ty:.2f}), "
+                f"dist={dist:.2f} m from robot ({cx:.2f}, {cy:.2f})")
 
             # Prefetch voice interaction for persons while navigating
             prefetch_result = [None]
@@ -1078,10 +1094,45 @@ class RobotCommander(Node):
 
             result = self.getResult()
             if result != TaskResult.SUCCEEDED:
-                self.warn(f"Nav to {label} at ({tx:.2f},{ty:.2f}) failed: {result}")
-                if prefetch_thread:
-                    prefetch_thread.join(timeout=5.0)
-                continue
+                self.warn(f"Nav to {label} at ({tx:.2f},{ty:.2f}) failed ({result}); trying fallback standoffs...")
+                succeeded = False
+                for fb_standoff in STANDOFF_FALLBACKS:
+                    # recompute approach from current robot position
+                    cx2 = self.current_pose.pose.position.x if hasattr(self, 'current_pose') else cx
+                    cy2 = self.current_pose.pose.position.y if hasattr(self, 'current_pose') else cy
+                    dx2, dy2 = tx - cx2, ty - cy2
+                    dist2 = math.hypot(dx2, dy2)
+                    if dist2 > fb_standoff:
+                        fb_goal_x = tx - (dx2 / dist2) * fb_standoff
+                        fb_goal_y = ty - (dy2 / dist2) * fb_standoff
+                    else:
+                        fb_goal_x, fb_goal_y = cx2, cy2
+                    fb_yaw = math.atan2(ty - fb_goal_y, tx - fb_goal_x)
+                    self.info(f"  Fallback: standoff={fb_standoff:.1f} m -> goal ({fb_goal_x:.2f}, {fb_goal_y:.2f})")
+                    fb_goal = PoseStamped()
+                    fb_goal.header.frame_id = 'map'
+                    fb_goal.header.stamp = self.get_clock().now().to_msg()
+                    fb_goal.pose.position.x = fb_goal_x
+                    fb_goal.pose.position.y = fb_goal_y
+                    fb_goal.pose.orientation = self.YawToQuaternion(fb_yaw)
+                    if not self.goToPose(fb_goal):
+                        continue
+                    fb_deadline = time.time() + 120.0
+                    while not self.isTaskComplete():
+                        time.sleep(0.5)
+                        if time.time() > fb_deadline:
+                            self.warn('Fallback navigation timed out; cancelling.')
+                            self.cancelTask()
+                            break
+                    if self.getResult() == TaskResult.SUCCEEDED:
+                        succeeded = True
+                        break
+                    self.warn(f"  Fallback standoff={fb_standoff:.1f} m also failed.")
+                if not succeeded:
+                    self.warn(f"All fallback attempts for {label} at ({tx:.2f},{ty:.2f}) failed; skipping.")
+                    if prefetch_thread:
+                        prefetch_thread.join(timeout=5.0)
+                    continue
 
             # --- interact / observe ---
             if ttype == 'person':

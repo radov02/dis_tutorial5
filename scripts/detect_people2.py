@@ -53,6 +53,16 @@ class detect_faces(Node):
 
 		self.marker_array_pub = self.create_publisher(MarkerArray, "/people_marker_array", QoSReliabilityPolicy.BEST_EFFORT)
 
+		# Publish face detections on /detected_faces with transient-local QoS
+		# so late-subscribing nodes (halfautonomous_search, RViz) get the full set.
+		from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy as Rel
+		_faces_qos = QoSProfile(
+			durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+			reliability=Rel.RELIABLE,
+			history=QoSHistoryPolicy.KEEP_LAST,
+			depth=1)
+		self.detected_faces_pub = self.create_publisher(MarkerArray, '/detected_faces', _faces_qos)
+
 		self.model = YOLO("yolov8n.pt")
 
 		self.faces = []
@@ -91,6 +101,7 @@ class detect_faces(Node):
 		self.tf_buf = tf2_ros.Buffer()
 		self.tf_listener = tf2_ros.TransformListener(self.tf_buf, self)
 		self.create_timer(2.0, self.log_face_positions)
+		self.create_timer(2.0, self._republish_face_markers)
 
 		self.get_logger().info(f"Node has been initialized! Will publish face markers to {marker_topic}.")
 
@@ -425,6 +436,12 @@ class detect_faces(Node):
 			marker_array.markers.append(marker)
 
 		self.marker_array_pub.publish(marker_array)
+		self.detected_faces_pub.publish(marker_array)
+
+	def _republish_face_markers(self):
+		"""Re-publish face markers periodically for late RViz / halfautonomous_search subscribers."""
+		if self.face_position_in_map_coordinates:
+			self.publish_all_markers()
 
 	def load_detections(self):
 		"""Load previously saved detections from JSON file."""

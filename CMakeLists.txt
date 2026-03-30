@@ -77,6 +77,14 @@ install(PROGRAMS scripts/voice_capture.py
 install(PROGRAMS scripts/map_geofence_tool.py
   DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS scripts/halfautonomous_search.py
+  RENAME halfautonomous_search
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS scripts/determine_search_points.py
+  RENAME determine_search_points
+  DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
 

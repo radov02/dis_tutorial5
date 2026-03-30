@@ -150,6 +150,11 @@ class RingDetector(Node):
         # subscribes (even later) immediately gets the full current set.
         self.ring_marker_pub = self.create_publisher(
             MarkerArray, "/detected_rings", qos_profile)
+        # Also publish on a second volatile publisher so RViz (volatile subscriber) sees them
+        self.ring_marker_pub_volatile = self.create_publisher(
+            MarkerArray, "/detected_rings", 10)
+        # Re-publish ring markers every 2 s for late-joining subscribers
+        self.create_timer(2.0, self._republish_ring_markers)
 
         # Load previously saved detections if available
         self.load_detections()
@@ -965,8 +970,16 @@ class RingDetector(Node):
             m.pose.position.y = y
             m.pose.position.z = z
 
+            m.text = cname       # consumed by halfautonomous_search
+
             ma.markers.append(m)
         self.ring_marker_pub.publish(ma)
+        self.ring_marker_pub_volatile.publish(ma)
+
+    def _republish_ring_markers(self):
+        """Re-publish ring markers periodically for late RViz subscribers."""
+        if self.ring_detections:
+            self._publish_ring_markers()
 
 
 def main():

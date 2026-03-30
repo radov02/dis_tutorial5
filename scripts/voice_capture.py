@@ -30,7 +30,7 @@ class VoiceNode(Node):
         self.llm_response_timeout = 12.0
         self.default_greeting = 'Hello! I hope you are doing well today.'
         self.greeting_prompt = (
-            'Reply with exactly one short friendly greeting to a factory worker that you just met. Be creative.'
+            'Reply with exactly one short friendly greeting to a factory worker that you met. You know the worker. Be creative.'
             'No quotes. Maximum 12 words.'
         )
         self.cached_greeting = None
